@@ -7,3 +7,4 @@ __pycache__/
 *.tsv
 !docs/**/*.tsv
 !reports/submission_log.tsv
+backups/
