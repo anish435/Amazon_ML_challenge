@@ -3,7 +3,7 @@
 from pathlib import Path
 import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 import polars as pl
 import psutil
 
@@ -18,6 +18,7 @@ TRAIN_RAW_DIR = DATA_RAW_DIR / "train"
 TEST_RAW_DIR = DATA_RAW_DIR / "test"
 
 DATA_PREP_DIR = PROJECT_ROOT / "data" / "prep"
+DATA_BLOCKS_DIR = PROJECT_ROOT / "data" / "blocks"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 FALLBACK_DIR = PROJECT_ROOT / "fallback"
@@ -63,8 +64,8 @@ def split_id(entity_id: str) -> int:
 
 
 def split_expr(col_name: str = "entity_id") -> pl.Expr:
-    """Polars expression to extract integer digits and compute modulo 100."""
-    return pl.col(col_name).str.extract(r"(\d+)", 1).cast(pl.Int64) % 100
+    """Polars expression to extract integer digits of entity_id and compute modulo 100."""
+    return pl.col(col_name).str.slice(3).cast(pl.Int64) % 100
 
 
 def get_split_name(bucket: int) -> str:
@@ -76,6 +77,52 @@ def get_split_name(bucket: int) -> str:
     elif 90 <= bucket <= 99:
         return "holdout"
     return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Integer ID Conversion Helpers (Memory Optimization)
+# ---------------------------------------------------------------------------
+def s1_to_num(entity_id: str) -> int:
+    """Extract integer digits from S1 entity_id ('S1-12345' -> 12345)."""
+    return int(entity_id[3:])
+
+
+def num_to_s1(s1_num: int) -> str:
+    """Reconstruct S1 entity_id from integer (12345 -> 'S1-12345')."""
+    return f"S1-{s1_num}"
+
+
+def cand_to_num_src(cand_id: str) -> Tuple[int, int]:
+    """Convert candidate ID ('S2-12345' or 'S3-67890') to (cand_num: int64, cand_src: int8)."""
+    return int(cand_id[3:]), int(cand_id[1])
+
+
+def num_src_to_cand(cand_num: int, cand_src: int) -> str:
+    """Reconstruct candidate ID from integer pair (12345, 2 -> 'S2-12345')."""
+    return f"S{cand_src}-{cand_num}"
+
+
+def test_id_round_trip() -> bool:
+    """Verifies round-trip fidelity across S1, S2, and S3 entity IDs."""
+    samples = [
+        ("S1-1", 1),
+        ("S1-925783039", 925783039),
+        ("S2-4887273", 4887273, 2),
+        ("S3-5082316", 5082316, 3),
+    ]
+    for item in samples[:2]:
+        s1_id, exp_num = item
+        num = s1_to_num(s1_id)
+        assert num == exp_num, f"s1_to_num failed: {num} != {exp_num}"
+        assert num_to_s1(num) == s1_id, f"num_to_s1 failed: {num_to_s1(num)} != {s1_id}"
+
+    for item in samples[2:]:
+        cand_id, exp_num, exp_src = item
+        num, src = cand_to_num_src(cand_id)
+        assert num == exp_num and src == exp_src, f"cand_to_num_src failed on {cand_id}"
+        assert num_src_to_cand(num, src) == cand_id, f"num_src_to_cand failed on {cand_id}"
+
+    return True
 
 
 # ---------------------------------------------------------------------------
