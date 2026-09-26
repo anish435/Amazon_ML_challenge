@@ -256,25 +256,27 @@ def compute_pair_features(
 # ---------------------------------------------------------------------------
 def get_or_fit_vectorizers(
     country: str,
+    split_cand: str = "train",
 ) -> Tuple[TfidfVectorizer, TfidfVectorizer]:
     """Fits or loads cached country candidate-pool TF-IDF vectorizers with minimal memory footprint."""
     DATA_FEATURES_DIR.mkdir(parents=True, exist_ok=True)
-    vec_name_path = DATA_FEATURES_DIR / f"tfidf_name_{country}.joblib"
-    vec_addr_path = DATA_FEATURES_DIR / f"tfidf_addr_{country}.joblib"
+    suffix = f"_{split_cand}" if split_cand != "train" else ""
+    vec_name_path = DATA_FEATURES_DIR / f"tfidf_name_{country}{suffix}.joblib"
+    vec_addr_path = DATA_FEATURES_DIR / f"tfidf_addr_{country}{suffix}.joblib"
 
     if vec_name_path.exists() and vec_addr_path.exists():
-        print(f"[{country}] Loading pre-fitted candidate pool vectorizers from {DATA_FEATURES_DIR}...", flush=True)
+        print(f"[{country}] Loading pre-fitted {split_cand} candidate pool vectorizers from {DATA_FEATURES_DIR}...", flush=True)
         vec_name = joblib.load(vec_name_path)
         vec_addr = joblib.load(vec_addr_path)
         return vec_name, vec_addr
 
-    print(f"[{country}] Fitting TF-IDF name vectorizer on candidate pool...", flush=True)
+    print(f"[{country}] Fitting TF-IDF name vectorizer on {split_cand} candidate pool...", flush=True)
     t0 = time.perf_counter()
 
     # Load only name_core
     cols_name = ["country", "name_core"]
-    s2_n = pl.read_parquet(PREP_FILES["train_s2"], columns=cols_name).filter(pl.col("country") == country)
-    s3_n = pl.read_parquet(PREP_FILES["train_s3"], columns=cols_name).filter(pl.col("country") == country)
+    s2_n = pl.read_parquet(PREP_FILES[f"{split_cand}_s2"], columns=cols_name).filter(pl.col("country") == country)
+    s3_n = pl.read_parquet(PREP_FILES[f"{split_cand}_s3"], columns=cols_name).filter(pl.col("country") == country)
     name_texts = pl.concat([s2_n["name_core"], s3_n["name_core"]]).fill_null("").to_list()
     del s2_n, s3_n
     gc.collect()
@@ -293,13 +295,13 @@ def get_or_fit_vectorizers(
 
     joblib.dump(vec_name, vec_name_path)
     rss_after_name = psutil.Process().memory_info().rss / (1024 ** 2)
-    print(f"[{country}] Name vectorizer fitted in {time.perf_counter() - t0:.1f}s (vocab={len(vec_name.vocabulary_):,}). RSS: {rss_after_name:.1f} MB", flush=True)
+    print(f"[{country}] Name vectorizer ({split_cand}) fitted in {time.perf_counter() - t0:.1f}s (vocab={len(vec_name.vocabulary_):,}). RSS: {rss_after_name:.1f} MB", flush=True)
 
-    print(f"[{country}] Fitting TF-IDF address vectorizer on candidate pool...", flush=True)
+    print(f"[{country}] Fitting TF-IDF address vectorizer on {split_cand} candidate pool...", flush=True)
     t0_addr = time.perf_counter()
     cols_addr = ["country", "addr_norm"]
-    s2_a = pl.read_parquet(PREP_FILES["train_s2"], columns=cols_addr).filter(pl.col("country") == country)
-    s3_a = pl.read_parquet(PREP_FILES["train_s3"], columns=cols_addr).filter(pl.col("country") == country)
+    s2_a = pl.read_parquet(PREP_FILES[f"{split_cand}_s2"], columns=cols_addr).filter(pl.col("country") == country)
+    s3_a = pl.read_parquet(PREP_FILES[f"{split_cand}_s3"], columns=cols_addr).filter(pl.col("country") == country)
     addr_texts = pl.concat([s2_a["addr_norm"], s3_a["addr_norm"]]).fill_null("").to_list()
     del s2_a, s3_a
     gc.collect()
@@ -318,7 +320,7 @@ def get_or_fit_vectorizers(
 
     joblib.dump(vec_addr, vec_addr_path)
     rss_after_addr = psutil.Process().memory_info().rss / (1024 ** 2)
-    print(f"[{country}] Address vectorizer fitted in {time.perf_counter() - t0_addr:.1f}s (vocab={len(vec_addr.vocabulary_):,}). RSS: {rss_after_addr:.1f} MB", flush=True)
+    print(f"[{country}] Address vectorizer ({split_cand}) fitted in {time.perf_counter() - t0_addr:.1f}s (vocab={len(vec_addr.vocabulary_):,}). RSS: {rss_after_addr:.1f} MB", flush=True)
 
     return vec_name, vec_addr
 
