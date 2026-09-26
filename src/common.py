@@ -19,6 +19,8 @@ TEST_RAW_DIR = DATA_RAW_DIR / "test"
 
 DATA_PREP_DIR = PROJECT_ROOT / "data" / "prep"
 DATA_BLOCKS_DIR = PROJECT_ROOT / "data" / "blocks"
+DATA_FEATURES_DIR = PROJECT_ROOT / "data" / "features"
+DATA_MODELS_DIR = PROJECT_ROOT / "data" / "models"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 FALLBACK_DIR = PROJECT_ROOT / "fallback"

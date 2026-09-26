@@ -165,3 +165,113 @@ Exact ground-truth match recall on blocked candidates across validation and hold
 - **Validation Recall**: **96.66%** ($\ge 95\%$ target exceeded).
 - **Holdout Recall**: **96.42%** ($\ge 95\%$ target exceeded).
 - **Candidate Volume**: Strictly bounded at **51.6 candidates/entity** (mean) and **57.0–58.0** (p90), well below the 80 max constraint.
+
+## Step 3 Feature Engineering Execution Report
+**Date/Time**: 2026-09-27 00:58:09
+**Total Features**: 38 float32 features
+**Overall Speed**: 19,130 pairs/sec at 20 threads (Total runtime: 484.6s = 8.08 min)
+
+### 1. Feature Generation Throughput by Split & Country
+| Split | Country | Pairs | Time (s) | Pairs/Sec | Parquet Size (MB) | Peak RSS (MB) | NaN/Inf Count |
+|---|---|---:|---:|---:|---:|---:|---:|
+| VAL | India | 411,096 | 12.5s | 32,991 | 35.9 MB | 1685.9 MB | 0/0 |
+| HOLDOUT | India | 205,662 | 6.9s | 29,604 | 17.8 MB | 1664.3 MB | 0/0 |
+| TRAIN | India | 3,078,306 | 116.7s | 26,387 | 277.6 MB | 2139.4 MB | 0/0 |
+| VAL | US | 620,042 | 19.3s | 32,102 | 53.0 MB | 1632.0 MB | 0/0 |
+| HOLDOUT | US | 310,045 | 8.2s | 37,689 | 26.2 MB | 1843.8 MB | 0/0 |
+| TRAIN | US | 4,645,060 | 154.2s | 30,131 | 410.3 MB | 2395.8 MB | 0/0 |
+
+### 2. Extrapolation for 88.7M Test Pairs
+- **Estimated Test Generation Time**: **0.78 hours** (~46.9 min at ~31,484 pairs/sec)
+- **Estimated Test Features Disk Size**: **7.67 GB** (based on 92.8 bytes/pair compressed)
+- **Free Disk Space Available**: **31.46 GB** (Sufficient: 7.67 GB << 31.46 GB free)
+
+
+## Step 4 Training & Model Evaluation Report
+**Date/Time**: 2026-09-27 01:32:59
+**Selected Model Architecture**: Stage 2 (xgboost_gpu)
+**Optimal Threshold (tau)**: **0.67**
+
+### 1. Model Benchmark: LightGBM CPU vs XGBoost GPU (1M Sample)
+| Library | Device / Threads | Training Time | Validation AUC | Selected |
+|---|---|---:|---:|:---:|
+| LightGBM | CPU (20 threads) | 37.46s | 0.99873 | NO |
+| XGBoost | GPU (NVIDIA RTX 3050 CUDA) | 15.26s | 0.99881 | YES |
+
+### 2. Stage 1 vs Stage 2 Validation Comparison
+- **Stage 1 (Pair Model, 38 features)**: Val Macro F0.5 = **0.93994** at tau = 0.67 (Val AUC: 0.99908, 2-Fold OOF AUC: 0.99901)
+- **Stage 2 (Context Model, 44 features)**: Val Macro F0.5 = **0.94359** at tau = 0.67 (Val AUC: 0.99922)
+- **Context Model Gain**: **+0.00365** macro F0.5.
+- **Greedy 1:1 Exact Ties**: 0 on validation, 0 on holdout.
+
+### 3. Final Performance Metrics (Validation vs Holdout)
+| Split | Country | Macro F0.5 | Precision | Recall | % Empty Pred | % True Singletons | Avg Pred Matches | Avg True Matches |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **Validation** | **OVERALL** | **0.94359** | 0.9773 | 0.8977 | 6.71% | 5.59% | 3.17 | 3.45 |
+| Validation | India | 0.92977 | - | - | - | - | - | - |
+| Validation | US | 0.95281 | - | - | - | - | - | - |
+| **Holdout** | **OVERALL** | **0.94528** | 0.9781 | 0.8969 | 6.47% | 5.48% | 3.17 | 3.46 |
+| Holdout | India | 0.92981 | - | - | - | - | - | - |
+| Holdout | US | 0.95560 | - | - | - | - | - | - |
+
+### 4. Tau Threshold Sensitivity Curve (Validation Macro F0.5)
+| Tau | 0.50 | 0.60 | 0.70 | 0.80 | 0.90 | 0.95 | 0.98 | **Best (0.67)** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Macro F0.5** | 0.93957 | 0.94274 | 0.94329 | 0.94069 | 0.92985 | 0.91449 | 0.88607 | **0.94359** |
+
+### 5. Top 15 Feature Importances
+| Rank | Feature | Importance |
+|---|---|---:|
+| 1 | `p1_rank` | 0.6 |
+| 2 | `p1_rank_src` | 0.1 |
+| 3 | `score_a` | 0.1 |
+| 4 | `p1_diff_best` | 0.1 |
+| 5 | `s1_n_cand_above_half` | 0.0 |
+| 6 | `p1_diff_second` | 0.0 |
+| 7 | `s1_best_p1` | 0.0 |
+| 8 | `house_num_conflict` | 0.0 |
+| 9 | `n_channels` | 0.0 |
+| 10 | `rank_a` | 0.0 |
+| 11 | `house_num_missing_cand` | 0.0 |
+| 12 | `house_num_overlap` | 0.0 |
+| 13 | `addr_norm_token_set_ratio` | 0.0 |
+| 14 | `name_core_partial_ratio` | 0.0 |
+| 15 | `name_norm_partial_ratio` | 0.0 |
+
+### 6. Error Analysis: 10 False Positives (Sample)
+| Country | S1 ID | S1 Name | S1 Address | Cand ID | Cand Name | Cand Address | Score | Diagnostic Reason |
+|---|---|---|---|---|---|---|---|---|
+| US | `S1-213984` | PW Frontier Globa LLC | 1700 Glenwood Drive, Moore, OK | `S2-990700183` | Martin Martin Frontier Globa LLC | 1700 GLENWOOD DRIVE, MOORE, OK | 0.722 | High orthographic string similarity on common brand or partial address collision |
+| India | `S1-418986` | Jain Foundation Limited | S-35/1, Gns Plaza, Site Iv, Kasna Road, Greater Noida, Gautam Buddha Nagar, Uttar Pradesh | `S3-733686614` | Jain Management | S-35/12, Gns Plaza, Site Iv, Kasna Road, Gautam Buddha, Greater Noida, UP | 0.710 | High orthographic string similarity on common brand or partial address collision |
+| India | `S1-626781` | Premier Raj Hospitality Private Limited | Bangalore, Karnataka, Joly Paul, 3Rd Floor, St, Marys Nagar, Bommanahalli, Managammanapalya, No 9/5/5, Bangalore | `S2-858287433` | ಪ್ರೀಮಿಯರ್ ರಾಜ್ ಮೀಡಿಯಾ ಪ್ರೈವೇಟ್ ಲಿಮಿಟೆಡ್ | DOOR NO G-9/5/12, JOLY PAUL, 3RD FLOOR, ST, MARYS NAGAR, BOMMANAHALLI, MANAGAMMANAPALYA, BANGALORE, ಕರ್ನಾಟಕ | 0.819 | High orthographic string similarity on common brand or partial address collision |
+| US | `S1-1070985` | Classic Information | 2718 Bowdish Road, WA, Spokane Valley, Unit G-338 | `S3-326564447` | Classic Information Corp | #2731 Bowdish Road, NULL, Spokane Valley, Washington | 0.856 | High orthographic string similarity on common brand or partial address collision |
+| India | `S1-2261981` | Nagaya Realty Private Limited | 28, Bazarpeth, 1St Floor, Near Meenatai Thakarey Hall, Bhiwandi, Bhiwandi, Thane, Maharashtra | `S2-405787580` | Nagayaer Realty-Private | www.nagayaerr.com | NO 922 30, BAZARPETH, 1ST FLOOR, NEAR MEENATAI THAKAREY HALL, BHIWANDI, BHIWANDI, Maharashtra | 0.770 | High orthographic string similarity on common brand or partial address collision |
+| India | `S1-3373087` | QY Communication LLP | Sno. 48/1/2 Nr.Kate Puram, Haveli, Pune, Maharashtra | `S2-36458485` | QY Communication L.L.P. | None | 0.945 | High orthographic string similarity on common brand or partial address collision |
+| US | `S1-3698981` | Lower Utilities | 955 Oak Dale Drive, Xenia, OH | `S2-381384424` | Lower Utilities [Co.] | 95 OAK DALE DR, XENIA, OH | 0.982 | High orthographic string similarity on common brand or partial address collision |
+| India | `S1-3879585` | Meenendra Renewables Pvt Ltd | Dcb-218, 2F, Dlf Cyber City, Bhubaneswar, Odisha, Bhubaneswar, Khordha, Orissa | `S3-148629982` | Meennendra Renewables Pvt Ltd | Dcb-219, 2F, Dlf Cyber City, Bhubaneswar, Odisha, Pur Bhubaneswar, Bhubaneswar, OD | 0.832 | High orthographic string similarity on common brand or partial address collision |
+| India | `S1-4353789` | Target (india) | H.No. 76/A-1, Balkeshwar Colony, Agra, Uttar Pradesh | `S3-958322160` | Target Buildwell | H.no 76/A-3, Balkeshwar Colony, Delhi, Agra, UP | 0.957 | High orthographic string similarity on common brand or partial address collision |
+| India | `S1-4573884` | Acg Industries Group Public Limited | 225/A, 15Th Cross, 9Th Main, 6Th Sector, Bangalore South, Bangalore, Karnataka | `S3-618185293` | Acg Industries Group | None | 0.844 | High orthographic string similarity on common brand or partial address collision |
+
+### 7. Error Analysis: 10 False Negatives (Sample)
+| Country | S1 ID | S1 Name | S1 Address | Cand ID | Cand Name | Cand Address | Diagnostic Reason |
+|---|---|---|---|---|---|---|---|
+| India | `S1-22633084` | Premier Foundation Limited | Gurgaon, Sushant Lok Phase 1 Near Park Plaza, Gurgaon, Haryana, C-329 | `S2-680658950` | प्रीमियर फाउंडेशन लिमिटेड | C-329, GURGAON, Haryana | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| India | `S1-22633084` | Premier Foundation Limited | Gurgaon, Sushant Lok Phase 1 Near Park Plaza, Gurgaon, Haryana, C-329 | `S3-912074059` | प्रीमियर फाउंडेशन लिमिटेड | No. 616 C-329, Gurgaon, HR | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| US | `S1-66222580` | Signature Aspac | 136 Patriot Way, Poca, WV | `S3-600441546` | Signature Áspac | None | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| India | `S1-337333581` | First Builders Private Limited | Mohali, Punjab, Scf 31 Phase-2 | `S3-914926798` | ਫਸਟ ਬਿਲਡਰਜ਼ ਪ੍ਰਾਈਵੇਟ ਲਿਮਟਿਡ | Scf 31 Pahse-2, Mohali, ਪੰਜਾਬ | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| US | `S1-302789684` | Teamsters Local 491 | 1301 3rd Street, Ozark, MO | `S3-129177983` | Teamsters Local 491 LP | None | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| US | `S1-856138680` | Bernier Certified Pharmaceutical Inc. | 5712 Truelson Drive, Fort Worth, TX | `S2-429878196` | BERNIER PHARMACEUTICAL INC. SERVICES | 5866 TRUELSON DR, NULL, FORT WORTH, TX | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| India | `S1-424774284` | New Delhi Aerospace Private Limited | 19 Narang Colony Janakpuri, New Delhi, Delhi | `S2-237416502` | New Delhi  Aer0space Private | None | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| India | `S1-388364080` | YJ Solar Limited | Falt No 301, Plot No 420, 3Rd Flr, Sapphire Vistas Deepthisri Nagar, Madeenaguda, Hafeezpet, Hyderabad, Rangareddy, Telangana | `S2-281306972` | Orbivantage | FALT NO G-301, RANGAREDDY, HYDERABAD, Telangana | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| US | `S1-105397585` | Desert Xsolla | 200 Jackson Drive, Berryville Town, VA | `S3-297617221` | lridrex | 200 Jackson Drive, Berryville CITY, Virginia | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+| US | `S1-409328987` | Value Textile Industries Inc | 126 Oak Street, South Dayton, NY | `S2-392838403` | Value Textile Industries | None | Severe abbreviation, legal entity divergence, or candidate pruned below threshold |
+
+### 8. Part Timings & Hardware Utilization
+- **data_load**: 0.67s (0.01 min)
+- **benchmark**: 63.61s (1.06 min)
+- **stage1_training**: 268.63s (4.48 min)
+- **stage2_training**: 139.35s (2.32 min)
+- **evaluation**: 1.97s (0.03 min)
+- **save_artifacts**: 0.19s (0.00 min)
+- **Peak RSS**: **3995.0 MB**
+
