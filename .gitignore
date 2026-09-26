@@ -1,0 +1,9 @@
+data/
+output/
+.venv/
+__pycache__/
+.DS_Store
+*.parquet
+*.tsv
+!docs/**/*.tsv
+!reports/submission_log.tsv
