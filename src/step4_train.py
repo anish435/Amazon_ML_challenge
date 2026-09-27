@@ -51,10 +51,14 @@ import psutil
 from sklearn.metrics import roc_auc_score, precision_score, recall_score
 import xgboost as xgb
 
+from rapidfuzz import fuzz
+
 from src.common import (
     DATA_BLOCKS_DIR,
     DATA_FEATURES_DIR,
+    DATA_FEATURES_V2_DIR,
     DATA_MODELS_DIR,
+    DATA_MODELS_V2_DIR,
     PREP_FILES,
     RAW_FILES,
     RUN_LOG_PATH,
@@ -62,7 +66,7 @@ from src.common import (
 )
 from tools.eval_macro_f05 import macro_f05_dataframe
 
-BASE_FEATURE_COLUMNS = [
+BASE_FEATURE_COLUMNS_V1: List[str] = [
     # a) Strings on name_norm (6)
     "name_norm_ratio", "name_norm_token_sort_ratio", "name_norm_token_set_ratio",
     "name_norm_partial_ratio", "name_norm_jaro_winkler", "name_norm_levenshtein",
@@ -85,7 +89,21 @@ BASE_FEATURE_COLUMNS = [
     "score_a", "score_b", "score_c", "rank_a", "rank_b", "rank_c", "n_channels",
 ]
 
-CONTEXT_FEATURE_COLUMNS = [
+NEW_BASE_FEATURE_COLUMNS_V2: List[str] = [
+    # g) Numbers from RAW address (5)
+    "raw_num_jaccard", "raw_num_all_equal", "raw_num_conflicts",
+    "raw_num_first_equal", "raw_num_first_dist",
+    # h) Sound-alike name similarity & script flags (4)
+    "skel_ratio", "skel_token_set_ratio", "is_non_latin_s1", "is_non_latin_cand",
+    # i) Candidate pool rarity (6)
+    "rarity_name_s1", "rarity_name_cand", "rarity_addr_s1", "rarity_addr_cand",
+    "rarity_name_diff", "rarity_addr_diff",
+]
+
+BASE_FEATURE_COLUMNS_V2: List[str] = BASE_FEATURE_COLUMNS_V1 + NEW_BASE_FEATURE_COLUMNS_V2
+BASE_FEATURE_COLUMNS: List[str] = BASE_FEATURE_COLUMNS_V2
+
+CONTEXT_FEATURE_COLUMNS_V1: List[str] = [
     "p1_rank",
     "p1_rank_src",
     "s1_best_p1",
@@ -94,15 +112,26 @@ CONTEXT_FEATURE_COLUMNS = [
     "p1_diff_second",
 ]
 
+GROUP_FEATURE_COLUMNS_V2: List[str] = [
+    "cand_group_max_name_sim",
+    "cand_group_max_addr_sim",
+    "cand_group_other_src",
+]
+
+CONTEXT_FEATURE_COLUMNS_V2: List[str] = CONTEXT_FEATURE_COLUMNS_V1 + GROUP_FEATURE_COLUMNS_V2
+CONTEXT_FEATURE_COLUMNS: List[str] = CONTEXT_FEATURE_COLUMNS_V2
+
 
 # ---------------------------------------------------------------------------
 # Data Loading Helper
 # ---------------------------------------------------------------------------
-def load_feature_split(split: str, countries: List[str]) -> pl.DataFrame:
+def load_feature_split(split: str, countries: List[str], features_dir: Optional[Path] = None) -> pl.DataFrame:
     """Loads feature parquet files for the given split and countries, adding string entity IDs."""
+    if features_dir is None:
+        features_dir = DATA_FEATURES_V2_DIR if DATA_FEATURES_V2_DIR.exists() else DATA_FEATURES_DIR
     dfs: List[pl.DataFrame] = []
     for country in countries:
-        fpath = DATA_FEATURES_DIR / f"{split}_{country}.parquet"
+        fpath = features_dir / f"{split}_{country}.parquet"
         if not fpath.exists():
             raise FileNotFoundError(f"Feature file not found: {fpath}")
         df = pl.read_parquet(fpath)
@@ -252,13 +281,117 @@ def run_model_benchmark(
 # ---------------------------------------------------------------------------
 # Section 3.3 Within-S1 Context Feature Computation
 # ---------------------------------------------------------------------------
+def compute_within_s1_group_features(
+    df: pl.DataFrame,
+    cand_text_df: Optional[pl.DataFrame] = None,
+) -> pl.DataFrame:
+    """Computes candidate group features against S1's top-2 OTHER candidates by p1.
+
+    Assumes df is already sorted by ['s1_num', p1] descending.
+    Features:
+      - cand_group_max_name_sim: max rapidfuzz token_set_ratio on name_core against top-2 other candidates
+      - cand_group_max_addr_sim: max rapidfuzz token_set_ratio on addr_norm against top-2 other candidates
+      - cand_group_other_src: 1.0 if ANY top-2 other candidate has cand_src != current cand_src, else 0.0
+    """
+    needs_drop = False
+    if "cand_name_core" not in df.columns or "cand_addr_norm" not in df.columns:
+        if cand_text_df is None:
+            s2 = pl.read_parquet(PREP_FILES["train_s2"], columns=["entity_id", "name_core", "addr_norm"]).with_columns([
+                pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("cand_num"),
+                pl.lit(2, dtype=pl.Int8).alias("cand_src"),
+            ])
+            s3 = pl.read_parquet(PREP_FILES["train_s3"], columns=["entity_id", "name_core", "addr_norm"]).with_columns([
+                pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("cand_num"),
+                pl.lit(3, dtype=pl.Int8).alias("cand_src"),
+            ])
+            cand_text_df = pl.concat([s2, s3]).select([
+                "cand_num", "cand_src",
+                pl.col("name_core").alias("cand_name_core"),
+                pl.col("addr_norm").alias("cand_addr_norm"),
+            ])
+        df = df.join(cand_text_df, on=["cand_num", "cand_src"], how="left")
+        needs_drop = True
+
+    s1_nums = df["s1_num"].to_numpy()
+    cand_srcs = df["cand_src"].to_numpy()
+    names = df["cand_name_core"].fill_null("").to_list()
+    addrs = df["cand_addr_norm"].fill_null("").to_list()
+
+    n = len(df)
+    max_name_sim = np.zeros(n, dtype=np.float32)
+    max_addr_sim = np.zeros(n, dtype=np.float32)
+    other_src = np.zeros(n, dtype=np.float32)
+
+    change_idx = np.flatnonzero(np.diff(s1_nums)) + 1
+    starts = np.concatenate(([0], change_idx))
+    ends = np.concatenate((change_idx, [n]))
+
+    for s, e in zip(starts, ends):
+        m = e - s
+        if m <= 1:
+            continue
+        elif m == 2:
+            sim_name = fuzz.token_set_ratio(names[s], names[s + 1]) / 100.0
+            sim_addr = fuzz.token_set_ratio(addrs[s], addrs[s + 1]) / 100.0
+            diff_src = 1.0 if cand_srcs[s] != cand_srcs[s + 1] else 0.0
+            max_name_sim[s] = sim_name
+            max_name_sim[s + 1] = sim_name
+            max_addr_sim[s] = sim_addr
+            max_addr_sim[s + 1] = sim_addr
+            other_src[s] = diff_src
+            other_src[s + 1] = diff_src
+        else:
+            n0, a0, src0 = names[s], addrs[s], cand_srcs[s]
+            n1, a1, src1 = names[s + 1], addrs[s + 1], cand_srcs[s + 1]
+            n2, a2, src2 = names[s + 2], addrs[s + 2], cand_srcs[s + 2]
+
+            sim_n01 = fuzz.token_set_ratio(n0, n1) / 100.0
+            sim_a01 = fuzz.token_set_ratio(a0, a1) / 100.0
+            sim_n02 = fuzz.token_set_ratio(n0, n2) / 100.0
+            sim_a02 = fuzz.token_set_ratio(a0, a2) / 100.0
+            sim_n12 = fuzz.token_set_ratio(n1, n2) / 100.0
+            sim_a12 = fuzz.token_set_ratio(a1, a2) / 100.0
+
+            max_name_sim[s] = max(sim_n01, sim_n02)
+            max_addr_sim[s] = max(sim_a01, sim_a02)
+            other_src[s] = 1.0 if (src1 != src0 or src2 != src0) else 0.0
+
+            max_name_sim[s + 1] = max(sim_n01, sim_n12)
+            max_addr_sim[s + 1] = max(sim_a01, sim_a12)
+            other_src[s + 1] = 1.0 if (src0 != src1 or src2 != src1) else 0.0
+
+            for i in range(s + 2, e):
+                ni, ai, srci = names[i], addrs[i], cand_srcs[i]
+                sim_ni0 = fuzz.token_set_ratio(ni, n0) / 100.0
+                sim_ni1 = fuzz.token_set_ratio(ni, n1) / 100.0
+                sim_ai0 = fuzz.token_set_ratio(ai, a0) / 100.0
+                sim_ai1 = fuzz.token_set_ratio(ai, a1) / 100.0
+                max_name_sim[i] = max(sim_ni0, sim_ni1)
+                max_addr_sim[i] = max(sim_ai0, sim_ai1)
+                other_src[i] = 1.0 if (src0 != srci or src1 != srci) else 0.0
+
+    df = df.with_columns([
+        pl.Series("cand_group_max_name_sim", max_name_sim, dtype=pl.Float32),
+        pl.Series("cand_group_max_addr_sim", max_addr_sim, dtype=pl.Float32),
+        pl.Series("cand_group_other_src", other_src, dtype=pl.Float32),
+    ])
+
+    if needs_drop:
+        df = df.drop(["cand_name_core", "cand_addr_norm"])
+    return df
+
+
 def add_within_s1_context_features(
     df: pl.DataFrame,
     p_col: str = "p1",
+    version: str = "v1",
+    cand_text_df: Optional[pl.DataFrame] = None,
 ) -> pl.DataFrame:
-    """Computes exactly 6 within-S1 context features from pair model score p1.
+    """Computes within-S1 context features from pair model score p1.
 
     Zero cross-S1 leakage (strictly within each S1 entity's candidate list).
+    v1: exactly 6 context features.
+    v2: 6 context features + 3 candidate group features against top-2 other candidates.
     """
     # Sort descending by p_col within s1_num
     sorted_df = df.sort(["s1_num", p_col], descending=[False, True])
@@ -276,6 +409,9 @@ def add_within_s1_context_features(
         .cast(pl.Float32)
         .alias("p1_diff_second"),
     ])
+
+    if version == "v2":
+        ctx_df = compute_within_s1_group_features(ctx_df, cand_text_df=cand_text_df)
 
     return ctx_df
 
@@ -457,18 +593,34 @@ def compute_split_evaluation(
 # Main Orchestrator
 # ---------------------------------------------------------------------------
 def main():
-    DATA_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    import argparse
+    parser = argparse.ArgumentParser(description="Step 4 Training & Model Evaluation")
+    parser.add_argument("--version", choices=["v1", "v2"], default="v2", help="Pipeline version (v1 or v2)")
+    args = parser.parse_args()
+    version = args.version
+
+    features_dir = DATA_FEATURES_V2_DIR if version == "v2" else DATA_FEATURES_DIR
+    models_dir = DATA_MODELS_V2_DIR if version == "v2" else DATA_MODELS_DIR
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    base_feature_cols = BASE_FEATURE_COLUMNS_V2 if version == "v2" else BASE_FEATURE_COLUMNS_V1
+    context_feature_cols = CONTEXT_FEATURE_COLUMNS_V2 if version == "v2" else CONTEXT_FEATURE_COLUMNS_V1
+    all_stage2_features = base_feature_cols + context_feature_cols
+
     countries = ["India", "US"]
     timings: Dict[str, float] = {}
 
-    print("\n================ STEP 4 TRAINING & THRESHOLD OPTIMIZATION ================", flush=True)
+    print(f"\n================ STEP 4 TRAINING & THRESHOLD OPTIMIZATION ({version.upper()}) ================", flush=True)
+    print(f"Features Directory: {features_dir}")
+    print(f"Models Directory:   {models_dir}")
+    print(f"Base Features:      {len(base_feature_cols)} | Stage 2 Features: {len(all_stage2_features)}")
 
     # 1. Load Data
     t0_data = time.perf_counter()
     print("Loading feature datasets (train, val, holdout)...", flush=True)
-    train_df = load_feature_split("train", countries)
-    val_df = load_feature_split("val", countries)
-    holdout_df = load_feature_split("holdout", countries)
+    train_df = load_feature_split("train", countries, features_dir=features_dir)
+    val_df = load_feature_split("val", countries, features_dir=features_dir)
+    holdout_df = load_feature_split("holdout", countries, features_dir=features_dir)
     timings["data_load"] = time.perf_counter() - t0_data
 
     print(f"Loaded train pairs: {len(train_df):,} | val pairs: {len(val_df):,} | holdout pairs: {len(holdout_df):,}", flush=True)
@@ -492,26 +644,26 @@ def main():
 
     # 2. Section 3.1: Model Benchmark (1M sample)
     t0_bench = time.perf_counter()
-    chosen_lib, bench_results = run_model_benchmark(train_df, val_df, BASE_FEATURE_COLUMNS)
+    chosen_lib, bench_results = run_model_benchmark(train_df, val_df, base_feature_cols)
     timings["benchmark"] = time.perf_counter() - t0_bench
 
     trainer = ModelTrainer(chosen_lib, seed=42)
 
     # 3. Section 3.2: Stage 1 Pair Model
-    print("\n================ 3.2 STAGE 1 PAIR MODEL TRAINING ================", flush=True)
+    print(f"\n================ 3.2 STAGE 1 PAIR MODEL TRAINING ({len(base_feature_cols)} FEATURES) ================", flush=True)
     t0_s1 = time.perf_counter()
 
     # 2-Fold Out-of-Fold (OOF) on train (split by S1 entity)
     fold_0_mask = (train_df["s1_num"] % 2 == 0).to_numpy()
     fold_1_mask = ~fold_0_mask
 
-    train_X = train_df.select(BASE_FEATURE_COLUMNS).to_numpy()
+    train_X = train_df.select(base_feature_cols).to_numpy()
     train_y = train_df["label"].to_numpy().astype(np.int8)
 
-    val_X = val_df.select(BASE_FEATURE_COLUMNS).to_numpy()
+    val_X = val_df.select(base_feature_cols).to_numpy()
     val_y = val_df["label"].to_numpy().astype(np.int8)
 
-    holdout_X = holdout_df.select(BASE_FEATURE_COLUMNS).to_numpy()
+    holdout_X = holdout_df.select(base_feature_cols).to_numpy()
 
     p1_oof = np.zeros(len(train_df), dtype=np.float32)
 
@@ -563,18 +715,43 @@ def main():
     print(f"Stage 1 Best Val Macro F0.5: {best_macro_s1:.5f} at tau={best_tau_s1:.2f}", flush=True)
 
     # 4. Section 3.3: Stage 2 Context Model
-    print("\n================ 3.3 STAGE 2 CONTEXT MODEL TRAINING ================", flush=True)
+    print(f"\n================ 3.3 STAGE 2 CONTEXT MODEL TRAINING ({len(all_stage2_features)} FEATURES) ================", flush=True)
     t0_s2 = time.perf_counter()
 
-    train_ctx_df = add_within_s1_context_features(train_df, p_col="p1")
+    cand_text_df = None
+    if version == "v2":
+        t0_cands = time.perf_counter()
+        print("Loading candidate text for Stage 2 group feature extraction...", flush=True)
+        s2_c = pl.read_parquet(PREP_FILES["train_s2"], columns=["entity_id", "name_core", "addr_norm"]).with_columns([
+            pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("cand_num"),
+            pl.lit(2, dtype=pl.Int8).alias("cand_src"),
+        ])
+        s3_c = pl.read_parquet(PREP_FILES["train_s3"], columns=["entity_id", "name_core", "addr_norm"]).with_columns([
+            pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("cand_num"),
+            pl.lit(3, dtype=pl.Int8).alias("cand_src"),
+        ])
+        cand_text_df = pl.concat([s2_c, s3_c]).select([
+            "cand_num", "cand_src",
+            pl.col("name_core").alias("cand_name_core"),
+            pl.col("addr_norm").alias("cand_addr_norm"),
+        ])
+        del s2_c, s3_c
+        gc.collect()
+        print(f"Loaded {len(cand_text_df):,} candidate strings in {time.perf_counter() - t0_cands:.2f}s", flush=True)
+
+    print("Computing within-S1 context and group features on train...", flush=True)
+    train_ctx_df = add_within_s1_context_features(train_df, p_col="p1", version=version, cand_text_df=cand_text_df)
     del train_df
     gc.collect()
 
-    val_ctx_df = add_within_s1_context_features(val_df, p_col="p1")
-    holdout_ctx_df = add_within_s1_context_features(holdout_df, p_col="p1")
+    print("Computing within-S1 context and group features on val & holdout...", flush=True)
+    val_ctx_df = add_within_s1_context_features(val_df, p_col="p1", version=version, cand_text_df=cand_text_df)
+    holdout_ctx_df = add_within_s1_context_features(holdout_df, p_col="p1", version=version, cand_text_df=cand_text_df)
 
-    all_stage2_features = BASE_FEATURE_COLUMNS + CONTEXT_FEATURE_COLUMNS
-    print(f"Total Stage 2 Features: {len(all_stage2_features)} ({len(BASE_FEATURE_COLUMNS)} base + {len(CONTEXT_FEATURE_COLUMNS)} context)", flush=True)
+    del cand_text_df
+    gc.collect()
+
+    print(f"Total Stage 2 Features: {len(all_stage2_features)} ({len(base_feature_cols)} base + {len(context_feature_cols)} context/group)", flush=True)
 
     train_s2_X = train_ctx_df.select(all_stage2_features).to_numpy()
     train_s2_y = train_ctx_df["label"].to_numpy().astype(np.int8)
@@ -627,7 +804,7 @@ def main():
     else:
         chosen_stage = "Stage 1"
         chosen_clf = stage1_full_clf
-        chosen_features = BASE_FEATURE_COLUMNS
+        chosen_features = base_feature_cols
         chosen_score_col = "p1"
         chosen_tau = best_tau_s1
         chosen_macro_val = best_macro_s1
@@ -656,18 +833,15 @@ def main():
 
     timings["evaluation"] = time.perf_counter() - t0_eval
 
-    # Stop Condition Check: holdout macro F0.5 < 0.80
-    if holdout_metrics["macro_f05"] < 0.80:
-        print(f"\n[STOP CONDITION TRIGGERED] Holdout Macro F0.5 {holdout_metrics['macro_f05']:.4f} < 0.80!", flush=True)
-
     # 6. Save Artifacts & Predictions
     t0_save = time.perf_counter()
-    print("\nSaving models and predictions to data/models/...", flush=True)
+    print(f"\nSaving models and predictions to {models_dir}...", flush=True)
 
-    joblib.dump(stage1_full_clf, DATA_MODELS_DIR / "stage1_model.joblib")
-    joblib.dump(stage2_clf, DATA_MODELS_DIR / "stage2_model.joblib")
+    joblib.dump(stage1_full_clf, models_dir / "stage1_model.joblib")
+    joblib.dump(stage2_clf, models_dir / "stage2_model.joblib")
 
     model_metadata = {
+        "version": version,
         "chosen_stage": chosen_stage,
         "chosen_lib": chosen_lib,
         "features": chosen_features,
@@ -679,148 +853,100 @@ def main():
         "holdout_metrics": holdout_metrics,
         "bench_results": bench_results,
     }
-    with open(DATA_MODELS_DIR / "model_summary.json", "w", encoding="utf-8") as f:
+    with open(models_dir / "model_summary.json", "w", encoding="utf-8") as f:
         json.dump(model_metadata, f, indent=2)
 
-    with open(DATA_MODELS_DIR / "feature_names.json", "w", encoding="utf-8") as f:
+    with open(models_dir / "feature_names.json", "w", encoding="utf-8") as f:
         json.dump(chosen_features, f, indent=2)
 
     # Save validation & holdout predictions for error analysis
     val_ctx_df.select(["s1_num", "cand_num", "cand_src", "p1", "p2", "label"]).write_parquet(
-        DATA_MODELS_DIR / "val_predictions.parquet", compression="lz4"
+        models_dir / "val_predictions.parquet", compression="lz4"
     )
     holdout_ctx_df.select(["s1_num", "cand_num", "cand_src", "p1", "p2", "label"]).write_parquet(
-        DATA_MODELS_DIR / "holdout_predictions.parquet", compression="lz4"
+        models_dir / "holdout_predictions.parquet", compression="lz4"
     )
     timings["save_artifacts"] = time.perf_counter() - t0_save
 
-    # 7. Feature Importances (Top 15)
+    # 7. Feature Importances (Top 25)
     if hasattr(chosen_clf, "feature_importances_"):
         raw_imp = chosen_clf.feature_importances_
     else:
         raw_imp = np.zeros(len(chosen_features))
     imp_order = np.argsort(raw_imp)[::-1]
-    top_15_features = [(chosen_features[i], float(raw_imp[i])) for i in imp_order[:15]]
+    top_features = [(chosen_features[i], float(raw_imp[i])) for i in imp_order[:25]]
 
-    # 8. Error Analysis: 10 False Positives + 10 False Negatives
-    print("\nExtracting 10 False Positives and 10 False Negatives with raw text...", flush=True)
-    # Join predictions with raw text from PREP_FILES
-    val_pred_assigned = val_assigned.join(
-        val_ctx_df.select(["s1", "cid", "label", chosen_score_col]), on=["s1", "cid"]
-    )
-    fp_pairs = val_pred_assigned.filter(pl.col("label") == 0).head(10)
+    # Importance of new v2 features specifically
+    new_features_eval = NEW_BASE_FEATURE_COLUMNS_V2 + GROUP_FEATURE_COLUMNS_V2
+    new_feat_importances = []
+    for nf in new_features_eval:
+        if nf in chosen_features:
+            idx = chosen_features.index(nf)
+            new_feat_importances.append((nf, float(raw_imp[idx])))
+    new_feat_importances.sort(key=lambda x: x[1], reverse=True)
 
-    # FN: true matches in GT that were NOT in val_assigned
-    t_uniq = all_gt_pairs.join(val_s1_all.select(["s1"]), on="s1")
-    fn_pairs = t_uniq.join(val_assigned, on=["s1", "cid"], how="anti").head(10)
+    # 8. GATE CHECK (Part 5)
+    v1_holdout_macro = 0.94528
+    v1_val_macro = 0.94359
+    gate_threshold = v1_holdout_macro + 0.003  # 0.94828
+    gate_passed = (holdout_metrics["macro_f05"] >= gate_threshold) and (val_metrics["macro_f05"] > v1_val_macro)
 
-    # Load raw text for these S1 and Candidates
-    needed_s1 = set(fp_pairs["s1"].to_list() + fn_pairs["s1"].to_list())
-    needed_cid = set(fp_pairs["cid"].to_list() + fn_pairs["cid"].to_list())
+    print("\n================ PART 5: GATE CHECK ================", flush=True)
+    print(f"v1 Baseline:       Val Macro F0.5 = {v1_val_macro:.5f} | Holdout Macro F0.5 = {v1_holdout_macro:.5f}")
+    print(f"v2 Result:         Val Macro F0.5 = {val_metrics['macro_f05']:.5f} | Holdout Macro F0.5 = {holdout_metrics['macro_f05']:.5f}")
+    print(f"Gate Requirements: Holdout >= {gate_threshold:.5f} (+0.003) AND Val > {v1_val_macro:.5f}")
+    diff_val = val_metrics["macro_f05"] - v1_val_macro
+    diff_holdout = holdout_metrics["macro_f05"] - v1_holdout_macro
+    print(f"Val Delta:         {diff_val:+.5f}")
+    print(f"Holdout Delta:     {diff_holdout:+.5f}")
 
-    s1_raw = pl.read_parquet(PREP_FILES["train_s1"]).filter(pl.col("entity_id").is_in(list(needed_s1))).select(["entity_id", "country", "name_raw", "addr_raw"])
-    s2_raw = pl.read_parquet(PREP_FILES["train_s2"]).filter(pl.col("entity_id").is_in(list(needed_cid))).select(["entity_id", "country", "name_raw", "addr_raw"])
-    s3_raw = pl.read_parquet(PREP_FILES["train_s3"]).filter(pl.col("entity_id").is_in(list(needed_cid))).select(["entity_id", "country", "name_raw", "addr_raw"])
-    cand_raw = pl.concat([s2_raw, s3_raw])
-
-    fp_samples: List[Dict[str, str]] = []
-    for r in fp_pairs.iter_rows(named=True):
-        s1_info = s1_raw.filter(pl.col("entity_id") == r["s1"]).to_dicts()
-        c_info = cand_raw.filter(pl.col("entity_id") == r["cid"]).to_dicts()
-        s1_n = s1_info[0]["name_raw"] if s1_info else "-"
-        s1_a = s1_info[0]["addr_raw"] if s1_info else "-"
-        c_n = c_info[0]["name_raw"] if c_info else "-"
-        c_a = c_info[0]["addr_raw"] if c_info else "-"
-        country = s1_info[0]["country"] if s1_info else "-"
-        score = r[chosen_score_col]
-        fp_samples.append({
-            "s1": r["s1"], "cid": r["cid"], "country": country,
-            "s1_name": s1_n, "s1_addr": s1_a, "cand_name": c_n, "cand_addr": c_a,
-            "score": f"{score:.3f}",
-            "reason": "High orthographic string similarity on common brand or partial address collision",
-        })
-
-    fn_samples: List[Dict[str, str]] = []
-    for r in fn_pairs.iter_rows(named=True):
-        s1_info = s1_raw.filter(pl.col("entity_id") == r["s1"]).to_dicts()
-        c_info = cand_raw.filter(pl.col("entity_id") == r["cid"]).to_dicts()
-        s1_n = s1_info[0]["name_raw"] if s1_info else "-"
-        s1_a = s1_info[0]["addr_raw"] if s1_info else "-"
-        c_n = c_info[0]["name_raw"] if c_info else "-"
-        c_a = c_info[0]["addr_raw"] if c_info else "-"
-        country = s1_info[0]["country"] if s1_info else "-"
-        fn_samples.append({
-            "s1": r["s1"], "cid": r["cid"], "country": country,
-            "s1_name": s1_n, "s1_addr": s1_a, "cand_name": c_n, "cand_addr": c_a,
-            "reason": "Severe abbreviation, legal entity divergence, or candidate pruned below threshold",
-        })
-
-    # 9. Format Final Report Markdown
-    lines: List[str] = []
-    lines.append("\n## Step 4 Training & Model Evaluation Report")
-    lines.append(f"**Date/Time**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"**Selected Model Architecture**: {chosen_stage} ({chosen_lib})")
-    lines.append(f"**Optimal Threshold (tau)**: **{chosen_tau:.2f}**\n")
-
-    lines.append("### 1. Model Benchmark: LightGBM CPU vs XGBoost GPU (1M Sample)")
-    lines.append("| Library | Device / Threads | Training Time | Validation AUC | Selected |")
-    lines.append("|---|---|---:|---:|:---:|")
-    lgb_info = bench_results.get("lightgbm_cpu", {})
-    xgb_info = bench_results.get("xgboost_gpu", {})
-    lines.append(f"| LightGBM | CPU (20 threads) | {lgb_info.get('time', 0):.2f}s | {lgb_info.get('auc', 0):.5f} | {'YES' if chosen_lib == 'lightgbm_cpu' else 'NO'} |")
-    if xgb_info.get("gpu_used"):
-        lines.append(f"| XGBoost | GPU (NVIDIA RTX 3050 CUDA) | {xgb_info.get('time', 0):.2f}s | {xgb_info.get('auc', 0):.5f} | {'YES' if chosen_lib == 'xgboost_gpu' else 'NO'} |")
+    if gate_passed:
+        gate_status_str = f"PASSED (Holdout {holdout_metrics['macro_f05']:.5f} >= {gate_threshold:.5f} and Val {val_metrics['macro_f05']:.5f} > {v1_val_macro:.5f})"
+        print(f"\n>>> [GATE PASSED] v2 satisfies improvement threshold! Proceeding to Step 6 test scoring. <<<\n", flush=True)
     else:
-        lines.append(f"| XGBoost | GPU (CUDA) | - | - | FAILED / UNAVAILABLE |")
+        gate_status_str = f"FAILED (Holdout {holdout_metrics['macro_f05']:.5f} < {gate_threshold:.5f} or Val {val_metrics['macro_f05']:.5f} <= {v1_val_macro:.5f})"
+        print(f"\n>>> [GATE FAILED] v2 does not meet required gain (+0.003). STOPPING. Fallback to v1. <<<\n", flush=True)
+
+    # 9. Format Report Markdown
+    lines: List[str] = []
+    lines.append(f"\n## Step 7 (v2) Retraining & Evaluation Report")
+    lines.append(f"**Date/Time**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"**Pipeline Version**: {version.upper()}")
+    lines.append(f"**Selected Model Architecture**: {chosen_stage} ({chosen_lib})")
+    lines.append(f"**Optimal Threshold (tau)**: **{chosen_tau:.2f}**")
+    lines.append(f"**Gate Decision**: **{gate_status_str}**\n")
+
+    lines.append("### 1. v1 vs v2 Performance Comparison")
+    lines.append("| Metric | v1 (Baseline) | v2 (New Features) | Delta |")
+    lines.append("|---|---:|---:|---:|")
+    lines.append(f"| **Val Macro F0.5** | {v1_val_macro:.5f} | **{val_metrics['macro_f05']:.5f}** | {diff_val:+.5f} |")
+    lines.append(f"| Val India Macro F0.5 | 0.93883 | {val_metrics['country_f05'].get('India', 0.0):.5f} | {val_metrics['country_f05'].get('India', 0.0) - 0.93883:+.5f} |")
+    lines.append(f"| Val US Macro F0.5 | 0.94835 | {val_metrics['country_f05'].get('US', 0.0):.5f} | {val_metrics['country_f05'].get('US', 0.0) - 0.94835:+.5f} |")
+    lines.append(f"| Val Precision | 0.9774 | {val_metrics['precision']:.4f} | {val_metrics['precision'] - 0.9774:+.4f} |")
+    lines.append(f"| Val Recall | 0.8976 | {val_metrics['recall']:.4f} | {val_metrics['recall'] - 0.8976:+.4f} |")
+    lines.append(f"| **Holdout Macro F0.5** | {v1_holdout_macro:.5f} | **{holdout_metrics['macro_f05']:.5f}** | {diff_holdout:+.5f} |")
+    lines.append(f"| Holdout India Macro F0.5 | 0.94056 | {holdout_metrics['country_f05'].get('India', 0.0):.5f} | {holdout_metrics['country_f05'].get('India', 0.0) - 0.94056:+.5f} |")
+    lines.append(f"| Holdout US Macro F0.5 | 0.95000 | {holdout_metrics['country_f05'].get('US', 0.0):.5f} | {holdout_metrics['country_f05'].get('US', 0.0) - 0.95000:+.5f} |")
+    lines.append(f"| Holdout Precision | 0.9782 | {holdout_metrics['precision']:.4f} | {holdout_metrics['precision'] - 0.9782:+.4f} |")
+    lines.append(f"| Holdout Recall | 0.9004 | {holdout_metrics['recall']:.4f} | {holdout_metrics['recall'] - 0.9004:+.4f} |")
     lines.append("")
 
-    lines.append("### 2. Stage 1 vs Stage 2 Validation Comparison")
-    lines.append(f"- **Stage 1 (Pair Model, 38 features)**: Val Macro F0.5 = **{best_macro_s1:.5f}** at tau = {best_tau_s1:.2f} (Val AUC: {val_s1_auc:.5f}, 2-Fold OOF AUC: {oof_auc:.5f})")
-    lines.append(f"- **Stage 2 (Context Model, 44 features)**: Val Macro F0.5 = **{best_macro_s2:.5f}** at tau = {best_tau_s2:.2f} (Val AUC: {val_s2_auc:.5f})")
-    lines.append(f"- **Context Model Gain**: **+{best_macro_s2 - best_macro_s1:.5f}** macro F0.5.")
-    lines.append(f"- **Greedy 1:1 Exact Ties**: {val_ties} on validation, {holdout_ties} on holdout.\n")
-
-    lines.append("### 3. Final Performance Metrics (Validation vs Holdout)")
-    lines.append("| Split | Country | Macro F0.5 | Precision | Recall | % Empty Pred | % True Singletons | Avg Pred Matches | Avg True Matches |")
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
-    for s_name, m in [("Validation", val_metrics), ("Holdout", holdout_metrics)]:
-        lines.append(
-            f"| **{s_name}** | **OVERALL** | **{m['macro_f05']:.5f}** | {m['precision']:.4f} | {m['recall']:.4f} | "
-            f"{m['empty_pred_pct']:.2f}% | {m['true_empty_pct']:.2f}% | {m['avg_pred_matches']:.2f} | {m['avg_true_matches']:.2f} |"
-        )
-        for c, sc in m["country_f05"].items():
-            lines.append(f"| {s_name} | {c} | {sc:.5f} | - | - | - | - | - | - |")
+    lines.append("### 2. Feature Importances of New v2 Features")
+    lines.append("| Feature Name | Feature Group | Importance |")
+    lines.append("|---|---|---:|")
+    for nf, imp in new_feat_importances:
+        grp = "Raw Unit Numbers" if "raw_num" in nf else ("Sound-alike / Script" if "skel" in nf or "non_latin" in nf else ("Pool Rarity" if "rarity" in nf else "Within-S1 Group"))
+        lines.append(f"| `{nf}` | {grp} | {imp:,.1f} |")
     lines.append("")
 
-    lines.append("### 4. Tau Threshold Sensitivity Curve (Validation Macro F0.5)")
-    lines.append("| Tau | 0.50 | 0.60 | 0.70 | 0.80 | 0.90 | 0.95 | 0.98 | **Best (" + f"{chosen_tau:.2f}" + ")** |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-    curve_vals = [chosen_tau_curve.get(t, 0.0) for t in [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]]
-    lines.append(f"| **Macro F0.5** | {curve_vals[0]:.5f} | {curve_vals[1]:.5f} | {curve_vals[2]:.5f} | {curve_vals[3]:.5f} | {curve_vals[4]:.5f} | {curve_vals[5]:.5f} | {curve_vals[6]:.5f} | **{chosen_macro_val:.5f}** |")
-    lines.append("")
-
-    lines.append("### 5. Top 15 Feature Importances")
+    lines.append("### 3. Top 15 Overall Feature Importances")
     lines.append("| Rank | Feature | Importance |")
     lines.append("|---|---|---:|")
-    for idx, (f_name, imp) in enumerate(top_15_features, 1):
+    for idx, (f_name, imp) in enumerate(top_features[:15], 1):
         lines.append(f"| {idx} | `{f_name}` | {imp:,.1f} |")
     lines.append("")
 
-    lines.append("### 6. Error Analysis: 10 False Positives (Sample)")
-    lines.append("| Country | S1 ID | S1 Name | S1 Address | Cand ID | Cand Name | Cand Address | Score | Diagnostic Reason |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
-    for fp in fp_samples:
-        lines.append(f"| {fp['country']} | `{fp['s1']}` | {fp['s1_name']} | {fp['s1_addr']} | `{fp['cid']}` | {fp['cand_name']} | {fp['cand_addr']} | {fp['score']} | {fp['reason']} |")
-    lines.append("")
-
-    lines.append("### 7. Error Analysis: 10 False Negatives (Sample)")
-    lines.append("| Country | S1 ID | S1 Name | S1 Address | Cand ID | Cand Name | Cand Address | Diagnostic Reason |")
-    lines.append("|---|---|---|---|---|---|---|---|")
-    for fn in fn_samples:
-        lines.append(f"| {fn['country']} | `{fn['s1']}` | {fn['s1_name']} | {fn['s1_addr']} | `{fn['cid']}` | {fn['cand_name']} | {fn['cand_addr']} | {fn['reason']} |")
-    lines.append("")
-
-    lines.append("### 8. Part Timings & Hardware Utilization")
+    lines.append("### 4. Part Timings & Utilization")
     for part, dur in timings.items():
         lines.append(f"- **{part}**: {dur:.2f}s ({dur/60:.2f} min)")
     peak_rss = psutil.Process().memory_info().rss / (1024 ** 2)
@@ -830,6 +956,9 @@ def main():
     report_md = "\n".join(lines) + "\n"
     append_to_run_log(report_md)
     print("\n" + report_md, flush=True)
+
+    if not gate_passed:
+        sys.exit(2)  # Non-zero exit code indicating gate stopped
 
 
 if __name__ == "__main__":

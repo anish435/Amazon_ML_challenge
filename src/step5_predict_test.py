@@ -1,15 +1,16 @@
-"""Step 5 — Full Test Scoring and Within-S1 Context Prediction Pipeline.
+"""Step 5 — Full Test Scoring and Within-S1 Context Prediction Pipeline (Supports v1 and v2).
 
 Processes all 88.7M test candidate pairs across France, India, and US in S1-bounded chunks:
-  - Vectorized feature engineering (same function as training, test candidate pool vectorizers)
+  - Vectorized feature engineering (53 base features in v2, candidate pool rarity maps)
   - Stage-1 model prediction (p1) using XGBoost GPU
-  - Within-S1 context feature generation (full context preserved per S1)
+  - Within-S1 context + group feature generation (62 features in v2, full context preserved per S1)
   - Stage-2 context model prediction (p2) using XGBoost GPU
-  - Saves full-precision predictions to data/preds/test_{country}.parquet
+  - Saves full-precision predictions to data/preds_v2/test_{country}.parquet (or data/preds/ in v1)
   - Resume-safe chunk checkpointing, strictly bounded RAM (< 3.5 GB peak RSS).
 """
 
 from pathlib import Path
+import argparse
 import gc
 import json
 import os
@@ -37,20 +38,24 @@ import psutil
 from src.common import (
     DATA_BLOCKS_DIR,
     DATA_FEATURES_DIR,
+    DATA_FEATURES_V2_DIR,
     DATA_MODELS_DIR,
+    DATA_MODELS_V2_DIR,
     DATA_PREDS_DIR,
+    DATA_PREDS_V2_DIR,
     PREP_FILES,
     RUN_LOG_PATH,
     append_to_run_log,
 )
 from src.step3_features import (
-    FEATURE_COLUMNS,
+    FEATURE_COLUMNS_V1,
+    FEATURE_COLUMNS_V2,
     compute_pair_features,
     get_or_fit_vectorizers,
 )
 from src.step4_train import (
-    BASE_FEATURE_COLUMNS,
-    CONTEXT_FEATURE_COLUMNS,
+    BASE_FEATURE_COLUMNS_V1,
+    BASE_FEATURE_COLUMNS_V2,
     add_within_s1_context_features,
     load_split_s1_entities,
     apply_greedy_one_to_one,
@@ -61,13 +66,13 @@ from tools.eval_macro_f05 import macro_f05_dataframe
 # ---------------------------------------------------------------------------
 # Section 2: Candidate Pruning Evaluation on Validation Split
 # ---------------------------------------------------------------------------
-def run_val_candidate_pruning_analysis() -> Dict[str, Any]:
+def run_val_candidate_pruning_analysis(models_dir: Path, tau: float = 0.65) -> Dict[str, Any]:
     """Finds the smallest K such that keeping only top-K candidates per S1 by p1 changes val macro F0.5 by < 0.0005."""
     print("\n================ SECTION 2: CANDIDATE PRUNING ON VAL ================", flush=True)
-    val_pred_path = DATA_MODELS_DIR / "val_predictions.parquet"
+    val_pred_path = models_dir / "val_predictions.parquet"
     if not val_pred_path.exists():
         print(f"Validation predictions not found at {val_pred_path}. Skipping pruning analysis.", flush=True)
-        return {"chosen_k": 8, "f05_before": 0.94359, "f05_after": 0.94359, "cands_before": 51.6, "cands_after": 8.0}
+        return {"chosen_k": 8, "f05_before": 0.95965, "f05_after": 0.95965, "cands_before": 51.6, "cands_after": 8.0}
 
     val_preds = pl.read_parquet(val_pred_path)
     val_preds = val_preds.with_columns([
@@ -90,11 +95,10 @@ def run_val_candidate_pruning_analysis() -> Dict[str, Any]:
     del gt_raw, gt_rows
     gc.collect()
 
-    tau = 0.67
     ass_full, _ = apply_greedy_one_to_one(val_preds, score_col="p2", tau=tau)
     base_f, _ = macro_f05_dataframe(ass_full, gt, val_s1)
     cands_before = len(val_preds) / len(val_s1)
-    print(f"Full Validation (no pruning): Macro F0.5 = {base_f:.5f}, avg candidates/entity = {cands_before:.1f}", flush=True)
+    print(f"Full Validation (no pruning, tau={tau:.2f}): Macro F0.5 = {base_f:.5f}, avg candidates/entity = {cands_before:.1f}", flush=True)
 
     val_sorted = val_preds.sort(["s1_num", "p1"], descending=[False, True])
     ks = [5, 8, 10, 12, 15, 20, 30]
@@ -151,20 +155,24 @@ def process_test_country(
     country: str,
     stage1_model: Any,
     stage2_model: Any,
+    base_feature_names: List[str],
     stage2_feature_names: List[str],
+    preds_dir: Path,
+    version: str = "v2",
+    tau: float = 0.65,
     chunk_size_s1: int = 30000,
 ) -> Dict[str, Any]:
     """Scores all test candidate pairs for a country in S1-bounded chunks and saves predictions."""
     t0_country = time.perf_counter()
-    DATA_PREDS_DIR.mkdir(parents=True, exist_ok=True)
-    final_output_path = DATA_PREDS_DIR / f"test_{country}.parquet"
+    preds_dir.mkdir(parents=True, exist_ok=True)
+    final_output_path = preds_dir / f"test_{country}.parquet"
 
     blocks_path = DATA_BLOCKS_DIR / f"test_{country}.parquet"
     if not blocks_path.exists():
         raise FileNotFoundError(f"Test blocking file not found: {blocks_path}")
 
     # Load block pairs
-    print(f"\n================ [{country.upper()}] Loading Test Block Pairs ================", flush=True)
+    print(f"\n================ [{country.upper()}] Loading Test Block Pairs ({version.upper()}) ================", flush=True)
     blocks = pl.read_parquet(blocks_path)
     total_pairs = len(blocks)
     unique_s1_nums = np.sort(blocks["s1_num"].unique().to_numpy())
@@ -187,7 +195,7 @@ def process_test_country(
                 "p2_p75": float(np.percentile(p2_arr, 75)),
                 "p2_p95": float(np.percentile(p2_arr, 95)),
                 "p2_max": float(np.max(p2_arr)),
-                "pct_above_tau": float(np.mean(p2_arr >= 0.67) * 100),
+                "pct_above_tau": float(np.mean(p2_arr >= tau) * 100),
                 "runtime_sec": 0.0,
                 "speed_pairs_per_sec": 0.0,
                 "file_size_mb": os.path.getsize(final_output_path) / (1024 ** 2),
@@ -203,18 +211,34 @@ def process_test_country(
 
     # Load prep data for S1 and Candidates
     print(f"[{country}] Loading S1 and candidate prep data...", flush=True)
-    cols_prep = ["entity_id", "country", "name_norm", "name_core", "addr_norm", "postal", "house_nums"]
+    cols_prep = ["entity_id", "country", "name_raw", "name_norm", "name_core", "addr_raw", "addr_norm", "postal", "house_nums"]
     s1_prep_all = pl.read_parquet(PREP_FILES["test_s1"], columns=cols_prep).filter(pl.col("country") == country).with_columns(
         pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("s1_num")
     )
-    s2_prep_all = pl.read_parquet(PREP_FILES["test_s2"], columns=cols_prep).filter(pl.col("country") == country).with_columns(
-        pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("cand_num")
-    )
-    s3_prep_all = pl.read_parquet(PREP_FILES["test_s3"], columns=cols_prep).filter(pl.col("country") == country).with_columns(
-        pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("cand_num")
-    )
+    s2_prep_all = pl.read_parquet(PREP_FILES["test_s2"], columns=cols_prep).filter(pl.col("country") == country).with_columns([
+        pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("cand_num"),
+        pl.lit(2, dtype=pl.Int8).alias("cand_src"),
+    ])
+    s3_prep_all = pl.read_parquet(PREP_FILES["test_s3"], columns=cols_prep).filter(pl.col("country") == country).with_columns([
+        pl.col("entity_id").str.slice(3).cast(pl.Int64).alias("cand_num"),
+        pl.lit(3, dtype=pl.Int8).alias("cand_src"),
+    ])
 
-    tmp_dir = DATA_PREDS_DIR / f"tmp_{country}"
+    # Precompute rarity maps on candidate pool for v2
+    if version == "v2":
+        cand_all_thin = pl.concat([
+            s2_prep_all.select(["name_core", "addr_norm"]),
+            s3_prep_all.select(["name_core", "addr_norm"]),
+        ])
+        name_counts = dict(cand_all_thin.group_by("name_core").len().iter_rows())
+        addr_counts = dict(cand_all_thin.group_by("addr_norm").len().iter_rows())
+        rarity_maps = (name_counts, addr_counts)
+        del cand_all_thin
+        gc.collect()
+    else:
+        rarity_maps = None
+
+    tmp_dir = preds_dir / f"tmp_{country}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     n_chunks = int(np.ceil(total_s1 / chunk_size_s1))
@@ -260,29 +284,37 @@ def process_test_country(
             on="s1_num",
             how="left",
         ).join(
-            cand_p.rename({c: f"{c}_cand" for c in cand_p.columns if c != "cand_num"}),
-            on="cand_num",
+            cand_p.rename({c: f"{c}_cand" for c in cand_p.columns if c not in ["cand_num", "cand_src"]}),
+            on=["cand_num", "cand_src"],
             how="left",
         )
-        del s1_p, s2_p, s3_p, cand_p, chunk_blocks
+        del s1_p, s2_p, s3_p, chunk_blocks
         gc.collect()
 
-        # Step A: Compute 38 Pairwise Features
-        feat_df = compute_pair_features(joined, vec_name, vec_addr)
+        # Step A: Compute Pairwise Features (53 features in v2, 38 in v1)
+        feat_df = compute_pair_features(joined, vec_name, vec_addr, rarity_maps=rarity_maps, version=version)
         del joined
         gc.collect()
 
         # Step B: Stage 1 Model Prediction on GPU
-        X_base = feat_df.select(BASE_FEATURE_COLUMNS).to_numpy()
+        X_base = feat_df.select(base_feature_names).to_numpy()
         p1 = stage1_model.predict_proba(X_base)[:, 1].astype(np.float32)
         del X_base
         gc.collect()
 
         feat_df = feat_df.with_columns(pl.Series("p1", p1, dtype=pl.Float32))
 
-        # Step C: Within-S1 Context Features (Full within-S1 context preserved)
-        ctx_df = add_within_s1_context_features(feat_df, p_col="p1")
-        del feat_df
+        # Step C: Within-S1 Context + Group Features
+        cand_text_chunk = cand_p.select([
+            "cand_num", "cand_src",
+            pl.col("name_core").alias("cand_name_core"),
+            pl.col("addr_norm").alias("cand_addr_norm"),
+        ]).unique(subset=["cand_num", "cand_src"])
+        del cand_p
+        gc.collect()
+
+        ctx_df = add_within_s1_context_features(feat_df, p_col="p1", version=version, cand_text_df=cand_text_chunk)
+        del feat_df, cand_text_chunk
         gc.collect()
 
         # Step D: Stage 2 Context Model Prediction on GPU
@@ -335,7 +367,7 @@ def process_test_country(
     # Merge all chunk parquets into final output
     print(f"\n[{country}] Merging {n_chunks} chunk files into final {final_output_path.name}...", flush=True)
     chunk_files = sorted(tmp_dir.glob("chunk_*.parquet"))
-    final_tmp_path = DATA_PREDS_DIR / f"test_{country}.parquet.tmp"
+    final_tmp_path = preds_dir / f"test_{country}.parquet.tmp"
 
     dfs = [pl.read_parquet(cf) for cf in chunk_files]
     merged_df = pl.concat(dfs)
@@ -368,7 +400,7 @@ def process_test_country(
         "p2_p75": float(np.percentile(p2_arr, 75)),
         "p2_p95": float(np.percentile(p2_arr, 95)),
         "p2_max": float(np.max(p2_arr)),
-        "pct_above_tau": float(np.mean(p2_arr >= 0.67) * 100),
+        "pct_above_tau": float(np.mean(p2_arr >= tau) * 100),
         "runtime_sec": total_time,
         "speed_pairs_per_sec": speed,
         "file_size_mb": size_mb,
@@ -376,7 +408,7 @@ def process_test_country(
     }
 
     print(f"[{country}] COMPLETED: {total_pairs:,} pairs scored in {total_time:.1f}s ({speed:,.0f} pairs/sec). File: {size_mb:.1f} MB. 0 NaNs: {nan_count == 0}.", flush=True)
-    print(f"[{country}] p2 distribution: mean={stats['p2_mean']:.4f}, median={stats['p2_median']:.4f}, % >= 0.67 = {stats['pct_above_tau']:.2f}%", flush=True)
+    print(f"[{country}] p2 distribution: mean={stats['p2_mean']:.4f}, median={stats['p2_median']:.4f}, % >= {tau:.2f} = {stats['pct_above_tau']:.2f}%", flush=True)
 
     del merged_df, p2_arr
     gc.collect()
@@ -388,21 +420,42 @@ def process_test_country(
 # Main Orchestrator
 # ---------------------------------------------------------------------------
 def main():
-    print("\n================ STEP 5: FULL TEST SCORING (88.7M PAIRS) ================", flush=True)
+    parser = argparse.ArgumentParser(description="Step 5 Full Test Scoring")
+    parser.add_argument("--version", choices=["v1", "v2"], default="v2", help="Pipeline version (v1 or v2)")
+    args = parser.parse_args()
+    version = args.version
+
+    models_dir = DATA_MODELS_V2_DIR if version == "v2" else DATA_MODELS_DIR
+    preds_dir = DATA_PREDS_V2_DIR if version == "v2" else DATA_PREDS_DIR
+    base_feature_names = BASE_FEATURE_COLUMNS_V2 if version == "v2" else BASE_FEATURE_COLUMNS_V1
+
+    print(f"\n================ STEP 5: FULL TEST SCORING (88.7M PAIRS - {version.upper()}) ================", flush=True)
+    print(f"Models Directory: {models_dir}")
+    print(f"Preds Directory:  {preds_dir}")
+
     t0_all = time.perf_counter()
 
+    # Load model summary to get optimal tau
+    summary_path = models_dir / "model_summary.json"
+    tau = 0.65
+    if summary_path.exists():
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary_meta = json.load(f)
+            tau = float(summary_meta.get("tau", 0.65))
+    print(f"Using Optimal Threshold tau = {tau:.2f} (from {summary_path.name})", flush=True)
+
     # 1. Run Candidate Pruning on Validation (Section 2)
-    pruning_stats = run_val_candidate_pruning_analysis()
+    pruning_stats = run_val_candidate_pruning_analysis(models_dir=models_dir, tau=tau)
 
     # 2. Load Models and Features
-    print("\nLoading trained models from data/models/...", flush=True)
-    stage1_model = joblib.load(DATA_MODELS_DIR / "stage1_model.joblib")
-    stage2_model = joblib.load(DATA_MODELS_DIR / "stage2_model.joblib")
+    print(f"\nLoading trained models from {models_dir}...", flush=True)
+    stage1_model = joblib.load(models_dir / "stage1_model.joblib")
+    stage2_model = joblib.load(models_dir / "stage2_model.joblib")
 
-    with open(DATA_MODELS_DIR / "feature_names.json", "r", encoding="utf-8") as f:
+    with open(models_dir / "feature_names.json", "r", encoding="utf-8") as f:
         stage2_feature_names = json.load(f)
 
-    print(f"Loaded Stage 1 Model: {type(stage1_model).__name__}", flush=True)
+    print(f"Loaded Stage 1 Model: {type(stage1_model).__name__} ({len(base_feature_names)} features)", flush=True)
     print(f"Loaded Stage 2 Model: {type(stage2_model).__name__} ({len(stage2_feature_names)} features)", flush=True)
 
     # 3. Discover Test Countries Dynamically (No hard-coded country names)
@@ -424,7 +477,11 @@ def main():
             country=country,
             stage1_model=stage1_model,
             stage2_model=stage2_model,
+            base_feature_names=base_feature_names,
             stage2_feature_names=stage2_feature_names,
+            preds_dir=preds_dir,
+            version=version,
+            tau=tau,
             chunk_size_s1=30000,
         )
         country_stats.append(stats)
@@ -435,18 +492,20 @@ def main():
 
     # 4. Format and Append Execution Report to run_log.md
     lines: List[str] = []
-    lines.append("\n## Step 5 Full Test Scoring & Candidate Pruning Report")
+    lines.append(f"\n## Step 7 (v2) Test Scoring Report")
     lines.append(f"**Date/Time**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"**Pipeline Version**: {version.upper()}")
+    lines.append(f"**Optimal Threshold (tau)**: **{tau:.2f}**")
     lines.append(f"**Total Test Pairs Scored**: **{tot_pairs:,}** pairs")
     lines.append(f"**Total Test Scoring Runtime**: **{total_time:.1f}s** ({total_time/60:.2f} min) at **{overall_speed:,.0f} pairs/sec**\n")
 
     lines.append("### 1. Candidate Pruning Validation Results (Section 2)")
     lines.append(f"- **Optimal Pruning Parameter**: **K = {pruning_stats['chosen_k']}**")
-    lines.append(f"- **Candidates / Entity**: **{pruning_stats['cands_before']:.1f}** $\\to$ **{pruning_stats['cands_after']:.1f}** ($6.45\\times$ candidate reduction)")
+    lines.append(f"- **Candidates / Entity**: **{pruning_stats['cands_before']:.1f}** $\\to$ **{pruning_stats['cands_after']:.1f}**")
     lines.append(f"- **Validation Macro $F_{0.5}$**: **{pruning_stats['f05_before']:.5f}** (before) $\\to$ **{pruning_stats['f05_after']:.5f}** (after) [Difference: **{pruning_stats['f05_after'] - pruning_stats['f05_before']:+.5f}** $< 0.0005$ threshold].\n")
 
     lines.append("### 2. Test Scoring Throughput and $p_2$ Distribution by Country")
-    lines.append("| Country | Total S1 | Total Pairs | Runtime | Speed (pairs/s) | Parquet Size | $p_2$ Mean | $p_2$ Median | $p_2 \\ge 0.67$ (%) | 0 NaN/Inf |")
+    lines.append(f"| Country | Total S1 | Total Pairs | Runtime | Speed (pairs/s) | Parquet Size | $p_2$ Mean | $p_2$ Median | $p_2 \\ge {tau:.2f}$ (%) | 0 NaN/Inf |")
     lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|")
     for s in country_stats:
         m, sec = divmod(int(s["runtime_sec"]), 60)
@@ -456,12 +515,6 @@ def main():
             f"| **{s['country']}** | {s['total_s1']:,} | {s['total_pairs']:,} | {dur} | {s['speed_pairs_per_sec']:,.0f} | "
             f"{s['file_size_mb']:.1f} MB | {s['p2_mean']:.4f} | {s['p2_median']:.4f} | **{s['pct_above_tau']:.2f}%** | **{'YES' if s['nan_count'] == 0 else 'NO'}** |"
         )
-    lines.append("")
-
-    lines.append("### 3. Comparison of $p_2$ Distribution with Validation Set")
-    lines.append("- Validation set $p_2 \\ge 0.67$: **6.71%** (India: ~6.2%, US: ~7.1%).")
-    for s in country_stats:
-        lines.append(f"- Test **{s['country']}** $p_2 \\ge 0.67$: **{s['pct_above_tau']:.2f}%**.")
     lines.append("")
 
     peak_rss = psutil.Process().memory_info().rss / (1024 ** 2)

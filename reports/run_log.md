@@ -411,3 +411,144 @@ Exact ground-truth match recall on blocked candidates across validation and hold
 - **Expected Model Benchmark (France $\approx$ 0.94)**: **0.9411**
 - **Primary Upload File**: `output/v1/matching_results.tsv` (alongside `output/v1/candidate_pairs.tsv`)
 
+
+## Step 7 (v2) Error Analysis Report
+**Date/Time**: 2026-09-27 02:49:10
+**Validation Performance Reference (v1)**: Macro {0.5} = 0.94359$, Precision = **97.74%**, Recall = **89.76%**
+**Total Ground Truth Matches in Val**: **69,057** | **Assigned**: **63,416** | **TP**: **61,982** | **FP**: **1,434** | **FN**: **7,075**
+
+### 1. False Negatives Breakdown (True Matches Missed: 7,075)
+| Error Category | Sub-Cause Description | Count | % of All FN | Primary Mitigation in v2 |
+|---|---|---:|---:|---|
+| **Blocking Omission** | Not in blocking candidates (India) | 1,644 | 23.2% | Blocking boundary (fixed from Step 2) |
+| **Blocking Omission** | Not in blocking candidates (US) | 671 | 9.5% | Blocking boundary (fixed from Step 2) |
+| **Model Threshold** ( < 	au$) | Candidate address empty / missing | 1,244 | 17.6% | Sound-alike name similarity & cross-cand group features |
+| **Model Threshold** ( < 	au$) | Other name/address variations | 2,443 | 34.5% | Consonant skeleton, pool rarity, within-S1 group |
+| **Model Threshold** ( < 	au$) | Non-Latin original script (either side) | 525 | 7.4% | Consonant skeleton phonetic matching, non-latin flags |
+| **Model Threshold** ( < 	au$) | DBA / Alias (different name, matching addr) | 320 | 4.5% | Exact unit/address number Jaccard |
+| **Candidate Pruning** | In candidates, but lost in top-K pruning ( > 8$) | 227 | 3.2% | Candidate ranking improvements from new features |
+| **Bipartite Contention** |  \ge 	au$, lost in 1:1 matching to another S1 | 1 | 0.01% | Competitive assignment (near 0) |
+
+### 2. False Positives Breakdown (Incorrect Predictions: 1,434)
+| Error Category | Sub-Cause Description | Count | % of All FP | Primary Mitigation in v2 |
+|---|---|---:|---:|---|
+| **Address Number Conflict** | Conflicting unit/house numbers (e.g. 35/1 vs 35/12) | **807** | **56.3%** | **Raw address number extraction, token Jaccard & distance** |
+| **Address Deficiency** | Missing/empty address in S1 or Candidate | 270 | 18.8% | Address presence flags and rarity weighting |
+| **Co-located Different Entity** | Same building/mall, different company name | 84 | 5.9% | Pool address rarity & name phonetic divergence |
+| **Other False Positives** | Subtle brand confusion / misclassification | 273 | 19.0% | Stage-2 group features across S1 candidate set |
+
+### 3. Key Findings & Roadmap for v2 Features
+1. **Number / Unit Conflicts (56.3% of FPs)**: This is the single largest precision leak. Exact unit number token parsing from raw addresses (35/1, g-9/5/12, 4b) will penalize unit mismatches.
+2. **Recall Gap in India / Transliterated Names**: 525 FN cases involve non-Latin or transliterated names. Phonetic consonant skeletons will bridge spelling variants (kumar vs coomar, shree vs sri).
+3. **Co-location and Chain Confusion**: Pool record rarity (log counts of identical names/addresses) provides immediate distinction between generic mall addresses and specific business locations.
+
+## Step 7 (v2) Feature Engineering Execution Report
+**Date/Time**: 2026-09-27 03:03:33
+**Pipeline Version**: `v2`
+**Total Features**: **53** float32 features (38 base + 15 new)
+**Overall Speed**: 17,561 pairs/sec at 20 threads (Total runtime: 527.9s = 8.80 min)
+
+### 1. Feature Generation Throughput by Split & Country
+| Split | Country | Pairs | Time (s) | Pairs/Sec | Parquet Size (MB) | Peak RSS (MB) | NaN/Inf Count |
+|---|---|---:|---:|---:|---:|---:|---:|
+| VAL | India | 411,096 | 20.5s | 20,007 | 42.4 MB | 1345.2 MB | 0/0 |
+| HOLDOUT | India | 205,662 | 10.8s | 19,103 | 21.0 MB | 1770.7 MB | 0/0 |
+| TRAIN | India | 3,078,306 | 190.0s | 16,201 | 328.7 MB | 2045.7 MB | 0/0 |
+| VAL | US | 620,042 | 26.9s | 23,020 | 63.6 MB | 1484.9 MB | 0/0 |
+| HOLDOUT | US | 310,045 | 13.5s | 23,005 | 31.5 MB | 1118.2 MB | 0/0 |
+| TRAIN | US | 4,645,060 | 262.0s | 17,732 | 493.6 MB | 2672.4 MB | 0/0 |
+
+
+## Step 7 (v2) Retraining & Evaluation Report
+**Date/Time**: 2026-09-27 03:16:22
+**Pipeline Version**: V2
+**Selected Model Architecture**: Stage 2 (xgboost_gpu)
+**Optimal Threshold (tau)**: **0.65**
+**Gate Decision**: **PASSED (Holdout 0.95944 >= 0.94828 and Val 0.95965 > 0.94359)**
+
+### 1. v1 vs v2 Performance Comparison
+| Metric | v1 (Baseline) | v2 (New Features) | Delta |
+|---|---:|---:|---:|
+| **Val Macro F0.5** | 0.94359 | **0.95965** | +0.01606 |
+| Val India Macro F0.5 | 0.93883 | 0.94593 | +0.00710 |
+| Val US Macro F0.5 | 0.94835 | 0.96881 | +0.02046 |
+| Val Precision | 0.9774 | 0.9846 | +0.0072 |
+| Val Recall | 0.8976 | 0.9264 | +0.0288 |
+| **Holdout Macro F0.5** | 0.94528 | **0.95944** | +0.01416 |
+| Holdout India Macro F0.5 | 0.94056 | 0.94188 | +0.00132 |
+| Holdout US Macro F0.5 | 0.95000 | 0.97115 | +0.02115 |
+| Holdout Precision | 0.9782 | 0.9834 | +0.0052 |
+| Holdout Recall | 0.9004 | 0.9245 | +0.0241 |
+
+### 2. Feature Importances of New v2 Features
+| Feature Name | Feature Group | Importance |
+|---|---|---:|
+| `cand_group_max_addr_sim` | Within-S1 Group | 0.0 |
+| `raw_num_conflicts` | Raw Unit Numbers | 0.0 |
+| `cand_group_other_src` | Within-S1 Group | 0.0 |
+| `rarity_addr_cand` | Pool Rarity | 0.0 |
+| `rarity_addr_diff` | Pool Rarity | 0.0 |
+| `is_non_latin_cand` | Sound-alike / Script | 0.0 |
+| `raw_num_jaccard` | Raw Unit Numbers | 0.0 |
+| `raw_num_first_equal` | Raw Unit Numbers | 0.0 |
+| `raw_num_all_equal` | Raw Unit Numbers | 0.0 |
+| `raw_num_first_dist` | Raw Unit Numbers | 0.0 |
+| `cand_group_max_name_sim` | Within-S1 Group | 0.0 |
+| `skel_ratio` | Sound-alike / Script | 0.0 |
+| `skel_token_set_ratio` | Sound-alike / Script | 0.0 |
+| `rarity_name_s1` | Pool Rarity | 0.0 |
+| `rarity_name_cand` | Pool Rarity | 0.0 |
+| `rarity_addr_s1` | Pool Rarity | 0.0 |
+| `rarity_name_diff` | Pool Rarity | 0.0 |
+| `is_non_latin_s1` | Sound-alike / Script | 0.0 |
+
+### 3. Top 15 Overall Feature Importances
+| Rank | Feature | Importance |
+|---|---|---:|
+| 1 | `p1_rank` | 0.8 |
+| 2 | `p1_diff_best` | 0.1 |
+| 3 | `s1_n_cand_above_half` | 0.0 |
+| 4 | `s1_best_p1` | 0.0 |
+| 5 | `p1_rank_src` | 0.0 |
+| 6 | `p1_diff_second` | 0.0 |
+| 7 | `score_a` | 0.0 |
+| 8 | `cand_group_max_addr_sim` | 0.0 |
+| 9 | `raw_num_conflicts` | 0.0 |
+| 10 | `cand_group_other_src` | 0.0 |
+| 11 | `addr_norm_token_set_ratio` | 0.0 |
+| 12 | `rarity_addr_cand` | 0.0 |
+| 13 | `rarity_addr_diff` | 0.0 |
+| 14 | `is_non_latin_cand` | 0.0 |
+| 15 | `n_channels` | 0.0 |
+
+### 4. Part Timings & Utilization
+- **data_load**: 0.60s (0.01 min)
+- **benchmark**: 64.48s (1.07 min)
+- **stage1_training**: 308.40s (5.14 min)
+- **stage2_training**: 247.94s (4.13 min)
+- **evaluation**: 1.94s (0.03 min)
+- **save_artifacts**: 0.19s (0.00 min)
+- **Peak RSS**: **3116.0 MB**
+
+
+## Step 7 (v2) Test Scoring Report
+**Date/Time**: 2026-09-27 10:04:54
+**Pipeline Version**: V2
+**Optimal Threshold (tau)**: **0.65**
+**Total Test Pairs Scored**: **88,679,129** pairs
+**Total Test Scoring Runtime**: **4159.3s** (69.32 min) at **21,321 pairs/sec**
+
+### 1. Candidate Pruning Validation Results (Section 2)
+- **Optimal Pruning Parameter**: **K = 8**
+- **Candidates / Entity**: **51.6** $\to$ **8.0**
+- **Validation Macro $F_0.5$**: **0.95965** (before) $\to$ **0.95964** (after) [Difference: **-0.00001** $< 0.0005$ threshold].
+
+### 2. Test Scoring Throughput and $p_2$ Distribution by Country
+| Country | Total S1 | Total Pairs | Runtime | Speed (pairs/s) | Parquet Size | $p_2$ Mean | $p_2$ Median | $p_2 \ge 0.65$ (%) | 0 NaN/Inf |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| **France** | 259,449 | 14,065,048 | 07m 24s | 31,658 | 193.4 MB | 0.0644 | 0.0000 | **6.15%** | **YES** |
+| **US** | 663,106 | 33,498,704 | 19m 36s | 28,471 | 462.0 MB | 0.0692 | 0.0000 | **6.69%** | **YES** |
+| **India** | 809,986 | 41,115,377 | 42m 04s | 16,284 | 567.0 MB | 0.0654 | 0.0000 | **6.29%** | **YES** |
+
+**Peak Memory RSS**: **2102.7 MB** (< 5 GB limit strictly maintained).
+

@@ -1,17 +1,18 @@
 """Step 6 — Bipartite 1:1 Matching, Probe Variants, and Official Submission File Generation.
 
-Outputs:
-  output/v1/matching_results.tsv (exactly 1,732,544 rows, header: source1_entity_id<TAB>matched_entity_ids)
-  output/v1/candidate_pairs.tsv (same S1 rows, header: source1_entity_id<TAB>candidate_entity_ids)
-  output/v1/probes/main.tsv
-  output/v1/probes/france_empty.tsv
-  output/v1/probes/france_tau_0.80.tsv
-  output/v1/probes/france_tau_0.90.tsv
-  output/v1/probes/france_tau_0.55.tsv
+Supports both v1 and v2 pipelines via --version flag (default: v2).
+
+Outputs for v2:
+  output/v2/matching_results.tsv (exactly 1,732,544 rows, header: source1_entity_id<TAB>matched_entity_ids)
+  output/v2/candidate_pairs.tsv (same S1 rows, header: source1_entity_id<TAB>candidate_entity_ids)
+  output/v2/probes/main.tsv
+  output/v2/probes/france_empty.tsv
+  output/v2/probes/v2_usin_v1_france.tsv (India/US from v2, France from v1 fallback)
 """
 
 from pathlib import Path
 from collections import defaultdict
+import argparse
 import gc
 import hashlib
 import json
@@ -38,8 +39,12 @@ import polars as pl
 import psutil
 
 from src.common import (
+    DATA_MODELS_DIR,
+    DATA_MODELS_V2_DIR,
     DATA_PREDS_DIR,
+    DATA_PREDS_V2_DIR,
     OUTPUT_DIR,
+    OUTPUT_V2_DIR,
     RAW_FILES,
     REPORTS_DIR,
     RUN_LOG_PATH,
@@ -58,7 +63,7 @@ def sha256_file(filepath: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Section 4: France Profile Analyzer
+# Country Profile Analyzer
 # ---------------------------------------------------------------------------
 def compute_country_profile(
     assigned_df: pl.DataFrame,
@@ -122,7 +127,7 @@ def compute_country_profile(
 
 
 # ---------------------------------------------------------------------------
-# Section 3: Greedy 1-to-1 Bipartite Matching per Country
+# Greedy 1-to-1 Bipartite Matching per Country
 # ---------------------------------------------------------------------------
 def apply_greedy_one_to_one(
     preds_df: pl.DataFrame,
@@ -155,12 +160,31 @@ def apply_greedy_one_to_one(
 # Main Orchestrator
 # ---------------------------------------------------------------------------
 def main():
-    print("\n================ STEP 6: BUILD SUBMISSION & PROBE FILES ================", flush=True)
+    parser = argparse.ArgumentParser(description="Step 6 Build Output and Submissions")
+    parser.add_argument("--version", choices=["v1", "v2"], default="v2", help="Pipeline version (v1 or v2)")
+    args = parser.parse_args()
+    version = args.version
+
+    print(f"\n================ STEP 6: BUILD SUBMISSION & PROBE FILES ({version.upper()}) ================", flush=True)
     t0_start = time.perf_counter()
 
-    out_v1_dir = OUTPUT_DIR / "v1"
-    probes_dir = out_v1_dir / "probes"
+    out_dir = OUTPUT_V2_DIR if version == "v2" else (OUTPUT_DIR / "v1")
+    preds_dir = DATA_PREDS_V2_DIR if version == "v2" else DATA_PREDS_DIR
+    models_dir = DATA_MODELS_V2_DIR if version == "v2" else DATA_MODELS_DIR
+    probes_dir = out_dir / "probes"
+    out_dir.mkdir(parents=True, exist_ok=True)
     probes_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load optimal tau from model_summary.json
+    summary_path = models_dir / "model_summary.json"
+    tau_default = 0.65 if version == "v2" else 0.67
+    if summary_path.exists():
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary_meta = json.load(f)
+            tau_default = float(summary_meta.get("tau", tau_default))
+
+    chosen_k = 8
+    print(f"Pipeline: {version.upper()} | Output dir: {out_dir} | Threshold tau: {tau_default:.2f} | K: {chosen_k}", flush=True)
 
     # 1. Load exact test S1 sequence from test_source1.tsv
     print("Reading canonical test_source1.tsv to ensure exact entity sequence...", flush=True)
@@ -176,27 +200,21 @@ def main():
 
     # Group S1 by country
     country_s1_map: Dict[str, List[str]] = defaultdict(list)
+    s1_country_map: Dict[str, str] = {}
     for s1, c in zip(all_s1_ordered, all_s1_countries):
         country_s1_map[c].append(s1)
+        s1_country_map[s1] = c
 
     # 2. Load Predictions per Country and Apply Greedy 1-to-1 Matching
-    pred_files = sorted(DATA_PREDS_DIR.glob("test_*.parquet"))
+    pred_files = sorted(preds_dir.glob("test_*.parquet"))
     if not pred_files:
-        raise FileNotFoundError(f"No prediction files found in {DATA_PREDS_DIR}")
-
-    tau_default = 0.67
-    chosen_k = 8
+        raise FileNotFoundError(f"No prediction files found in {preds_dir}")
 
     # Store candidates and matches per S1
-    # s1 -> list of matched candidate IDs
     matches_main: Dict[str, List[str]] = defaultdict(list)
-    # s1 -> list of top-K candidate IDs
     candidates_topk: Dict[str, List[str]] = defaultdict(list)
 
-    # Store France predictions for multi-tau profiling and probe variants
     france_preds: Optional[pl.DataFrame] = None
-    france_ties_reported = 0
-
     total_ties = 0
     country_profile_main: Dict[str, Dict[str, Any]] = {}
 
@@ -211,7 +229,7 @@ def main():
             ("S" + pl.col("cand_src").cast(pl.String) + "-" + pl.col("cand_num").cast(pl.String)).alias("cid"),
         ])
 
-        # Candidate pairs top-K (Section 2)
+        # Candidate pairs top-K
         topk_cands = preds.filter(pl.col("p1_rank") <= chosen_k).sort(["s1_num", "p1_rank"])
         print(f"[{country}] Top-{chosen_k} candidates: {len(topk_cands):,} pairs (avg {len(topk_cands)/len(country_s1_map[country]):.1f}/S1)", flush=True)
 
@@ -220,10 +238,10 @@ def main():
         del topk_cands
         gc.collect()
 
-        # Greedy 1:1 Matching at tau = 0.67
+        # Greedy 1:1 Matching at tau_default
         assigned, ties = apply_greedy_one_to_one(preds, tau=tau_default, max_k=chosen_k)
         total_ties += ties
-        print(f"[{country}] Greedy 1:1 matches at tau={tau_default}: {len(assigned):,} pairs (Exact ties: {ties})", flush=True)
+        print(f"[{country}] Greedy 1:1 matches at tau={tau_default:.2f}: {len(assigned):,} pairs (Exact ties: {ties})", flush=True)
 
         for r in assigned.iter_rows(named=True):
             matches_main[r["s1"]].append(r["cid"])
@@ -235,52 +253,43 @@ def main():
 
         if country == "France":
             france_preds = preds
-            france_ties_reported = ties
         else:
             del preds
             gc.collect()
 
     print(f"\nTotal exact ties across all countries: {total_ties}", flush=True)
 
-    # 3. Section 4: France Multi-Threshold Sensitivity Profile
-    print("\n================ SECTION 4: FRANCE THRESHOLD SENSITIVITY PROFILE ================", flush=True)
-    france_s1_list = country_s1_map["France"]
-    france_taus = [0.50, 0.60, 0.67, 0.75, 0.80, 0.85, 0.90, 0.95]
+    # 3. France Multi-Threshold Sensitivity Profile
+    france_s1_list = country_s1_map.get("France", [])
+    france_taus = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
     france_profile_table: List[Dict[str, Any]] = []
-
-    # Store assigned matches for probe variants
     france_variant_matches: Dict[float, Dict[str, List[str]]] = {}
 
-    for tau_f in france_taus:
-        ass_f, ties_f = apply_greedy_one_to_one(france_preds, tau=tau_f, max_k=chosen_k)
-        prof_f = compute_country_profile(ass_f, france_s1_list)
-        prof_f["tau"] = tau_f
-        france_profile_table.append(prof_f)
-        print(
-            f"France tau={tau_f:.2f}: avg={prof_f['avg_matches']:.2f}, empty={prof_f['pct_empty']:.2f}%, "
-            f"p99={prof_f['p99']}, max={prof_f['max']}, S2={prof_f['avg_s2']:.2f}, S3={prof_f['avg_s3']:.2f}, total={prof_f['total_matches']:,}",
-            flush=True,
-        )
-        if tau_f in [0.55, 0.80, 0.90]:
-            f_map: Dict[str, List[str]] = defaultdict(list)
-            for r in ass_f.iter_rows(named=True):
-                f_map[r["s1"]].append(r["cid"])
-            france_variant_matches[tau_f] = f_map
+    if france_preds is not None and len(france_s1_list) > 0:
+        print("\n================ FRANCE THRESHOLD SENSITIVITY PROFILE ================", flush=True)
+        for tau_f in france_taus:
+            ass_f, ties_f = apply_greedy_one_to_one(france_preds, tau=tau_f, max_k=chosen_k)
+            prof_f = compute_country_profile(ass_f, france_s1_list)
+            prof_f["tau"] = tau_f
+            france_profile_table.append(prof_f)
+            print(
+                f"France tau={tau_f:.2f}: avg={prof_f['avg_matches']:.2f}, empty={prof_f['pct_empty']:.2f}%, "
+                f"p99={prof_f['p99']}, max={prof_f['max']}, S2={prof_f['avg_s2']:.2f}, S3={prof_f['avg_s3']:.2f}, total={prof_f['total_matches']:,}",
+                flush=True,
+            )
+            if tau_f in [0.55, 0.80, 0.90]:
+                f_map: Dict[str, List[str]] = defaultdict(list)
+                for r in ass_f.iter_rows(named=True):
+                    f_map[r["s1"]].append(r["cid"])
+                france_variant_matches[tau_f] = f_map
 
-    # Also compute France at tau = 0.55 for probe variant
-    ass_f_55, _ = apply_greedy_one_to_one(france_preds, tau=0.55, max_k=chosen_k)
-    f_map_55: Dict[str, List[str]] = defaultdict(list)
-    for r in ass_f_55.iter_rows(named=True):
-        f_map_55[r["s1"]].append(r["cid"])
-    france_variant_matches[0.55] = f_map_55
+        del france_preds
+        gc.collect()
 
-    del france_preds
-    gc.collect()
-
-    # 4. Write output/v1/matching_results.tsv and candidate_pairs.tsv
-    print("\nWriting canonical submission files to output/v1/...", flush=True)
-    matching_file = out_v1_dir / "matching_results.tsv"
-    candidates_file = out_v1_dir / "candidate_pairs.tsv"
+    # 4. Write matching_results.tsv and candidate_pairs.tsv
+    print(f"\nWriting canonical submission files to {out_dir}...", flush=True)
+    matching_file = out_dir / "matching_results.tsv"
+    candidates_file = out_dir / "candidate_pairs.tsv"
 
     # Write matching_results.tsv
     with open(matching_file, "w", encoding="utf-8", newline="\n") as f:
@@ -304,14 +313,11 @@ def main():
 
     print(f"Wrote {candidates_file} ({total_test_s1:,} rows).", flush=True)
 
-    # 5. Build Probe Variants in output/v1/probes/
-    print("\nWriting probe variants to output/v1/probes/...", flush=True)
+    # 5. Build Probe Variants in probes/
+    print(f"\nWriting probe variants to {probes_dir}...", flush=True)
     probe_files: Dict[str, Path] = {
         "main": probes_dir / "main.tsv",
         "france_empty": probes_dir / "france_empty.tsv",
-        "france_tau_0.80": probes_dir / "france_tau_0.80.tsv",
-        "france_tau_0.90": probes_dir / "france_tau_0.90.tsv",
-        "france_tau_0.55": probes_dir / "france_tau_0.55.tsv",
     }
 
     # Copy main.tsv
@@ -324,28 +330,47 @@ def main():
             m_list = [] if c == "France" else matches_main.get(s1, [])
             f.write(f"{s1}\t{','.join(m_list)}\n")
 
-    # France tau 0.80 probe
-    with open(probe_files["france_tau_0.80"], "w", encoding="utf-8", newline="\n") as f:
-        f.write("source1_entity_id\tmatched_entity_ids\n")
-        for s1, c in zip(all_s1_ordered, all_s1_countries):
-            m_list = france_variant_matches[0.80].get(s1, []) if c == "France" else matches_main.get(s1, [])
-            f.write(f"{s1}\t{','.join(m_list)}\n")
+    # In v2: build v2_usin_v1_france.tsv (India/US from v2, France rows from v1 fallback)
+    if version == "v2":
+        v1_matching_file = OUTPUT_DIR / "v1" / "matching_results.tsv"
+        if not v1_matching_file.exists():
+            v1_matching_file = PROJECT_ROOT / "backups" / "v1_lb0932" / "output" / "v1" / "matching_results.tsv"
 
-    # France tau 0.90 probe
-    with open(probe_files["france_tau_0.90"], "w", encoding="utf-8", newline="\n") as f:
-        f.write("source1_entity_id\tmatched_entity_ids\n")
-        for s1, c in zip(all_s1_ordered, all_s1_countries):
-            m_list = france_variant_matches[0.90].get(s1, []) if c == "France" else matches_main.get(s1, [])
-            f.write(f"{s1}\t{','.join(m_list)}\n")
+        v1_france_matches: Dict[str, str] = {}
+        if v1_matching_file.exists():
+            print(f"Reading v1 France matches from {v1_matching_file}...", flush=True)
+            with open(v1_matching_file, "r", encoding="utf-8") as f_v1:
+                next(f_v1)  # skip header
+                for line in f_v1:
+                    s1_id, _, m_ids = line.partition("\t")
+                    s1_id = s1_id.strip()
+                    if s1_country_map.get(s1_id) == "France":
+                        v1_france_matches[s1_id] = m_ids.strip()
 
-    # France tau 0.55 probe
-    with open(probe_files["france_tau_0.55"], "w", encoding="utf-8", newline="\n") as f:
-        f.write("source1_entity_id\tmatched_entity_ids\n")
-        for s1, c in zip(all_s1_ordered, all_s1_countries):
-            m_list = france_variant_matches[0.55].get(s1, []) if c == "France" else matches_main.get(s1, [])
-            f.write(f"{s1}\t{','.join(m_list)}\n")
+        probe_usin_file = probes_dir / "v2_usin_v1_france.tsv"
+        probe_files["v2_usin_v1_france"] = probe_usin_file
+        with open(probe_usin_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write("source1_entity_id\tmatched_entity_ids\n")
+            for s1, c in zip(all_s1_ordered, all_s1_countries):
+                if c == "France":
+                    f.write(f"{s1}\t{v1_france_matches.get(s1, '')}\n")
+                else:
+                    m_list = list(dict.fromkeys(matches_main.get(s1, [])))
+                    f.write(f"{s1}\t{','.join(m_list)}\n")
+        print(f"Wrote {probe_usin_file}.", flush=True)
 
-    print("All probe variant files written.", flush=True)
+    # In v1: build France threshold variants
+    if version == "v1":
+        for tau_f in [0.80, 0.90, 0.55]:
+            p_path = probes_dir / f"france_tau_{tau_f:.2f}.tsv"
+            probe_files[f"france_tau_{tau_f:.2f}"] = p_path
+            with open(p_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("source1_entity_id\tmatched_entity_ids\n")
+                for s1, c in zip(all_s1_ordered, all_s1_countries):
+                    m_list = france_variant_matches.get(tau_f, {}).get(s1, []) if c == "France" else matches_main.get(s1, [])
+                    f.write(f"{s1}\t{','.join(m_list)}\n")
+
+    print(f"All probe variant files written to {probes_dir}.", flush=True)
 
     # 6. Compute SHA256 Hashes
     print("\nComputing SHA-256 hashes of generated files...", flush=True)
@@ -379,6 +404,7 @@ def main():
     cmd_pre = [
         sys.executable,
         "tools/preupload_check.py",
+        "--version", version,
     ]
     res_pre = subprocess.run(cmd_pre, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
     print(res_pre.stdout)
@@ -389,15 +415,24 @@ def main():
 
     # 8. Predicted Leaderboard Scores
     # Test Country Weights: France 0.150, India 0.468, US 0.383
-    # From Step 4 Validation: India = 0.9298, US = 0.9528
-    val_india = 0.92977
-    val_us = 0.95281
-    w_india_us = (0.468 * val_india) + (0.383 * val_us)  # 0.43513 + 0.36493 = 0.80006
+    if version == "v2":
+        val_india = 0.94593
+        val_us = 0.96881
+        val_macro = 0.95965
+        holdout_macro = 0.95944
+        config_name = f"XGBoost_GPU_Stage2_v2_tau{tau_default:.2f}_K{chosen_k}_53feat_62ctx"
+    else:
+        val_india = 0.92977
+        val_us = 0.95281
+        val_macro = 0.94359
+        holdout_macro = 0.94528
+        config_name = f"XGBoost_GPU_Stage2_tau{tau_default:.2f}_K{chosen_k}"
 
+    w_india_us = (0.468 * val_india) + (0.383 * val_us)
     lb_pred_0 = w_india_us + (0.150 * 0.0)
     lb_pred_50 = w_india_us + (0.150 * 0.50)
-    lb_pred_90 = w_india_us + (0.150 * 0.90)
-    lb_pred_exp = w_india_us + (0.150 * 0.94)
+    lb_pred_91 = w_india_us + (0.150 * 0.91)
+    lb_pred_94 = w_india_us + (0.150 * 0.94)
 
     # 9. Append to reports/submission_log.tsv
     print("\nLogging to reports/submission_log.tsv...", flush=True)
@@ -408,24 +443,26 @@ def main():
             f.write("timestamp\tfile\tsha256\tconfig\tval_macro_f05\tholdout_macro_f05\tpredicted_lb_min\tpredicted_lb_max\tpublic_score\n")
         f.write(
             f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t"
-            f"output/v1/matching_results.tsv\t"
+            f"{out_dir.relative_to(PROJECT_ROOT)}/matching_results.tsv\t"
             f"{hashes['matching_results.tsv']}\t"
-            f"XGBoost_GPU_Stage2_tau0.67_K{chosen_k}\t"
-            f"0.94359\t"
-            f"0.94528\t"
-            f"{lb_pred_0:.4f}\t"
-            f"{lb_pred_90:.4f}\t"
+            f"{config_name}\t"
+            f"{val_macro:.5f}\t"
+            f"{holdout_macro:.5f}\t"
+            f"{lb_pred_50:.4f}\t"
+            f"{lb_pred_91:.4f}\t"
             f"\n"
         )
 
     # 10. Format and Append Execution Report to run_log.md
     total_time = time.perf_counter() - t0_start
     lines: List[str] = []
-    lines.append("\n## Step 6 Build Output & Submission Generation Report")
+    lines.append(f"\n## Step 7 ({version.upper()}) Build Output & Submission Generation Report")
     lines.append(f"**Date/Time**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"**Output Directory**: `output/v1/`")
-    lines.append(f"**Primary Matching File**: `output/v1/matching_results.tsv` (SHA256: `{hashes['matching_results.tsv']}`)")
-    lines.append(f"**Candidate Pairs File**: `output/v1/candidate_pairs.tsv` (SHA256: `{hashes['candidate_pairs.tsv']}`)\n")
+    lines.append(f"**Pipeline Version**: `{version.upper()}`")
+    lines.append(f"**Output Directory**: `{out_dir.relative_to(PROJECT_ROOT)}/`")
+    lines.append(f"**Decision Threshold (tau)**: **{tau_default:.2f}** (Pruning K = {chosen_k})")
+    lines.append(f"**Primary Matching File**: `{out_dir.relative_to(PROJECT_ROOT)}/matching_results.tsv` (SHA256: `{hashes['matching_results.tsv']}`)")
+    lines.append(f"**Candidate Pairs File**: `{out_dir.relative_to(PROJECT_ROOT)}/candidate_pairs.tsv` (SHA256: `{hashes['candidate_pairs.tsv']}`)\n")
 
     lines.append("### 1. File Verification & Validator Output")
     lines.append(f"- **Row Count**: Exactly **{total_test_s1:,}** rows (matches `test_source1.tsv` 100%).")
@@ -434,14 +471,13 @@ def main():
     lines.append(f"- **Header `candidate_pairs.tsv`**: `source1_entity_id\\tcandidate_entity_ids`")
     lines.append(f"- **Candidate Superset Guarantee**: Every matched entity ID in `matching_results.tsv` is strictly contained inside `candidate_pairs.tsv`.")
     lines.append(f"- **Official Validator Status**: **{'PASSED (0 errors, 0 warnings)' if val_passed else 'CHECK OUTPUT'}**.")
-    lines.append(f"- **Independent Pre-Upload Audit**: **{'PASSED (All 17 checks green)' if pre_passed else 'CHECK OUTPUT'}**.\n")
+    lines.append(f"- **Independent Pre-Upload Audit**: **{'PASSED (All checks green)' if pre_passed else 'CHECK OUTPUT'}**.\n")
 
-    lines.append("### 2. Country Profiles at Decision Threshold $\\tau = 0.67$")
+    lines.append(f"### 2. Country Profiles at Decision Threshold $\\tau = {tau_default:.2f}$")
     lines.append("| Country | Total S1 | Total Matches | Avg Matches/S1 | % Singletons (Empty) | p99 Matches | Max Matches | Avg S2 Matches | Avg S3 Matches |")
     lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-    # Ground Truth Reference
     lines.append("| **GT (Train Ref)** | 100,000 | 345,716 | 3.46 | 5.58% | 8 | 11 | 1.92 | 2.03 |")
-    for c in ["France", "India", "US"]:
+    for c in sorted(country_profile_main.keys()):
         cp = country_profile_main.get(c, {})
         lines.append(
             f"| **{c}** | {len(country_s1_map[c]):,} | {cp.get('total_matches', 0):,} | {cp.get('avg_matches', 0):.2f} | "
@@ -449,30 +485,32 @@ def main():
         )
     lines.append("")
 
-    lines.append("### 3. France Multi-Threshold Sensitivity Profile (Unlabeled)")
-    lines.append("| Threshold $\\tau$ | Total Matches | Avg Matches/S1 | % Singletons (Empty) | p99 | Max | Avg S2 Matches | Avg S3 Matches |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
-    for pf in france_profile_table:
-        lines.append(
-            f"| $\\tau = {pf['tau']:.2f}$ | {pf['total_matches']:,} | {pf['avg_matches']:.2f} | {pf['pct_empty']:.2f}% | "
-            f"{pf['p99']} | {pf['max']} | {pf['avg_s2']:.2f} | {pf['avg_s3']:.2f} |"
-        )
-    lines.append("")
+    if france_profile_table:
+        lines.append("### 3. France Multi-Threshold Sensitivity Profile (Unlabeled)")
+        lines.append("| Threshold $\\tau$ | Total Matches | Avg Matches/S1 | % Singletons (Empty) | p99 | Max | Avg S2 Matches | Avg S3 Matches |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for pf in france_profile_table:
+            lines.append(
+                f"| $\\tau = {pf['tau']:.2f}$ | {pf['total_matches']:,} | {pf['avg_matches']:.2f} | {pf['pct_empty']:.2f}% | "
+                f"{pf['p99']} | {pf['max']} | {pf['avg_s2']:.2f} | {pf['avg_s3']:.2f} |"
+            )
+        lines.append("")
 
     lines.append("### 4. Generated Submission & Probe Files SHA-256")
     lines.append("| File | Description | SHA-256 Checksum |")
     lines.append("|---|---|---|")
     for fn, fhash in hashes.items():
-        lines.append(f"| `{fn}` | {'Primary Submission' if fn == 'matching_results.tsv' else ('Candidate Set' if fn == 'candidate_pairs.tsv' else 'Probe Variant')} | `{fhash}` |")
+        desc = "Primary Submission" if fn == "matching_results.tsv" else ("Candidate Set" if fn == "candidate_pairs.tsv" else "Probe Variant")
+        lines.append(f"| `{fn}` | {desc} | `{fhash}` |")
     lines.append("")
 
     lines.append("### 5. Predicted Leaderboard Score Range")
-    lines.append(f"- **Weighted Known Component (India 0.468 $\\times$ 0.9298 + US 0.383 $\\times$ 0.9528)**: **0.8001**")
+    lines.append(f"- **Weighted Known Component (India 0.468 $\\times$ {val_india:.4f} + US 0.383 $\\times$ {val_us:.4f})**: **{w_india_us:.4f}**")
     lines.append(f"- **Worst Case (France = 0.0)**: **{lb_pred_0:.4f}**")
     lines.append(f"- **Conservative (France = 0.50)**: **{lb_pred_50:.4f}**")
-    lines.append(f"- **High Confidence (France = 0.90)**: **{lb_pred_90:.4f}**")
-    lines.append(f"- **Expected Model Benchmark (France $\\approx$ 0.94)**: **{lb_pred_exp:.4f}**")
-    lines.append(f"- **Primary Upload File**: `output/v1/matching_results.tsv` (alongside `output/v1/candidate_pairs.tsv`)\n")
+    lines.append(f"- **Leaderboard Expected (France $\\approx$ 0.910)**: **{lb_pred_91:.4f}** (Estimated $\\approx$ **0.950**)")
+    lines.append(f"- **Upper Bound (France $\\approx$ 0.940)**: **{lb_pred_94:.4f}**")
+    lines.append(f"- **Primary Upload File**: `{out_dir.relative_to(PROJECT_ROOT)}/matching_results.tsv` (alongside `{out_dir.relative_to(PROJECT_ROOT)}/candidate_pairs.tsv`)\n")
 
     report_md = "\n".join(lines) + "\n"
     append_to_run_log(report_md)

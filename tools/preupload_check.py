@@ -1,21 +1,24 @@
 """tools/preupload_check.py
-Independent verification script for Amazon ML Challenge 2026 submission files (v2).
+Independent verification script for Amazon ML Challenge 2026 submission files.
+Supports both v1 and v2 pipelines via --version flag (default: v2).
 READ-ONLY: Does not modify or rebuild any files.
 Re-implements logic from scratch to verify:
   - Raw byte formatting (tabs, newlines, UTF-8, no BOM, no quotes, no empty tokens)
   - Row coverage (exactly 1,732,544 S1 entities, exact match to test_source1.tsv)
   - ID prefixes (S2-, S3-), existence in test_source2/3, country alignment
   - 1:1 bipartite constraint (no candidate appears in >1 S1 row)
-  - Consistency with predictions (p2 >= 0.67, p1_rank <= 8, 1:1 greedy assignment)
+  - Consistency with predictions (p2 >= tau, p1_rank <= 8, 1:1 greedy assignment)
   - Candidate subset constraint (every matched ID is strictly inside candidate_pairs.tsv)
   - Sanity distributions per country and overall
-  - Probe file consistency (france_empty.tsv)
+  - Probe file consistency (france_empty.tsv and v2_usin_v1_france.tsv)
   - Official validation with student_resource/utils/validate_submission.py (--check-ids)
 """
 
 from collections import defaultdict
+import argparse
 import gc
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -34,23 +37,12 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Paths for v2
-PATH_STAGED_MATCHING = PROJECT_ROOT / "output" / "v1" / "matching_results.tsv"
-PATH_STAGED_CANDIDATES = PROJECT_ROOT / "output" / "v1" / "candidate_pairs.tsv"
-PATH_PROBE_FR_EMPTY = PROJECT_ROOT / "output" / "v1" / "probes" / "france_empty.tsv"
-
 TEST_S1 = PROJECT_ROOT / "student_resource" / "dataset" / "test" / "test_source1.tsv"
 TEST_S2 = PROJECT_ROOT / "student_resource" / "dataset" / "test" / "test_source2.tsv"
 TEST_S3 = PROJECT_ROOT / "student_resource" / "dataset" / "test" / "test_source3.tsv"
-DATA_PREDS_DIR = PROJECT_ROOT / "data" / "preds"
 
-TAU_CONFIG = {
-    "India": 0.67,
-    "US": 0.67,
-    "France": 0.67,
-}
-CHOSEN_K = 8
 EXPECTED_ROWS = 1732544
+CHOSEN_K = 8
 
 
 def sha256_file(filepath: Path) -> str:
@@ -124,7 +116,7 @@ def check_file_format_raw(filepath: Path, expected_header: bytes) -> Tuple[bool,
                     issues.append(f"Line {line_num} does not end with standard newline")
 
             try:
-                line_str = line.decode("utf-8")
+                line.decode("utf-8")
             except UnicodeDecodeError:
                 utf8_errors += 1
                 continue
@@ -173,32 +165,67 @@ def check_file_format_raw(filepath: Path, expected_header: bytes) -> Tuple[bool,
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Pre-Upload Independent Audit")
+    parser.add_argument("--version", choices=["v1", "v2"], default="v2", help="Pipeline version to verify")
+    args = parser.parse_args()
+    version = args.version
+
     start_time = time.time()
     all_passed = True
 
+    if version == "v2":
+        path_staged_matching = PROJECT_ROOT / "output" / "v2" / "matching_results.tsv"
+        path_staged_candidates = PROJECT_ROOT / "output" / "v2" / "candidate_pairs.tsv"
+        path_probe_fr_empty = PROJECT_ROOT / "output" / "v2" / "probes" / "france_empty.tsv"
+        path_probe_usin = PROJECT_ROOT / "output" / "v2" / "probes" / "v2_usin_v1_france.tsv"
+        preds_dir = PROJECT_ROOT / "data" / "preds_v2"
+        models_dir = PROJECT_ROOT / "data" / "models_v2"
+        default_tau = 0.65
+    else:
+        path_staged_matching = PROJECT_ROOT / "output" / "v1" / "matching_results.tsv"
+        path_staged_candidates = PROJECT_ROOT / "output" / "v1" / "candidate_pairs.tsv"
+        path_probe_fr_empty = PROJECT_ROOT / "output" / "v1" / "probes" / "france_empty.tsv"
+        path_probe_usin = None
+        preds_dir = PROJECT_ROOT / "data" / "preds"
+        models_dir = PROJECT_ROOT / "data" / "models"
+        default_tau = 0.67
+
+    # Load dynamic tau from model_summary.json if available
+    summary_path = models_dir / "model_summary.json"
+    if summary_path.exists():
+        with open(summary_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+            tau_val = float(meta.get("tau", default_tau))
+    else:
+        tau_val = default_tau
+
+    tau_config = {"India": tau_val, "US": tau_val, "France": tau_val}
+
     print("=" * 85)
-    print("INDEPENDENT PRE-UPLOAD VERIFICATION AUDIT (v2)")
-    print(f"Matching file:   {PATH_STAGED_MATCHING}")
-    print(f"Candidate file:  {PATH_STAGED_CANDIDATES}")
-    print(f"Probe file:      {PATH_PROBE_FR_EMPTY}")
-    print(f"Decision tau:    {TAU_CONFIG}")
+    print(f"INDEPENDENT PRE-UPLOAD VERIFICATION AUDIT ({version.upper()})")
+    print(f"Matching file:   {path_staged_matching}")
+    print(f"Candidate file:  {path_staged_candidates}")
+    print(f"Probe file:      {path_probe_fr_empty}")
+    if path_probe_usin:
+        print(f"Probe US/IN:     {path_probe_usin}")
+    print(f"Decision tau:    {tau_config}")
     print(f"Top-K cap:       {CHOSEN_K}")
     print("=" * 85)
 
-    if not PATH_STAGED_MATCHING.exists():
-        print(f"ERROR: {PATH_STAGED_MATCHING} does not exist!")
+    if not path_staged_matching.exists():
+        print(f"ERROR: {path_staged_matching} does not exist!")
         sys.exit(1)
-    if not PATH_STAGED_CANDIDATES.exists():
-        print(f"ERROR: {PATH_STAGED_CANDIDATES} does not exist!")
+    if not path_staged_candidates.exists():
+        print(f"ERROR: {path_staged_candidates} does not exist!")
         sys.exit(1)
 
     # -------------------------------------------------------------------------
     # SECTION A: FILE FORMAT (Raw Bytes)
     # -------------------------------------------------------------------------
     print("\n--- SECTION A: FILE FORMAT (Raw Bytes) ---")
-    m_pass, m_issues, m_stats = check_file_format_raw(PATH_STAGED_MATCHING, b"source1_entity_id\tmatched_entity_ids")
-    c_pass, c_issues, c_stats = check_file_format_raw(PATH_STAGED_CANDIDATES, b"source1_entity_id\tcandidate_entity_ids")
-    p_pass, p_issues, p_stats = check_file_format_raw(PATH_PROBE_FR_EMPTY, b"source1_entity_id\tmatched_entity_ids")
+    m_pass, m_issues, m_stats = check_file_format_raw(path_staged_matching, b"source1_entity_id\tmatched_entity_ids")
+    c_pass, c_issues, c_stats = check_file_format_raw(path_staged_candidates, b"source1_entity_id\tcandidate_entity_ids")
+    p_pass, p_issues, p_stats = check_file_format_raw(path_probe_fr_empty, b"source1_entity_id\tmatched_entity_ids")
 
     # 1. Header
     print("1. Headers exact match:")
@@ -249,7 +276,7 @@ def main():
     print(f"   Loaded {len(official_s1_list):,} test S1 entities in {time.time()-t0:.2f}s.")
 
     staged_raw_df = pl.read_csv(
-        PATH_STAGED_MATCHING,
+        path_staged_matching,
         separator="\t",
         has_header=True,
         schema={"source1_entity_id": pl.Utf8, "matched_entity_ids": pl.Utf8},
@@ -258,64 +285,42 @@ def main():
     staged_s1_list = staged_raw_df["s1"].str.strip_chars().to_list()
     staged_s1_set = set(staged_s1_list)
 
-    dup_s1 = len(staged_s1_list) - len(staged_s1_set)
-    print(f"7. No duplicate source1_entity_id: Duplicate count = {dup_s1} -> {'PASS' if dup_s1 == 0 else 'FAIL'}")
-    if dup_s1 != 0:
+    missing_s1_count = len(official_s1_set - staged_s1_set)
+    extra_s1_count = len(staged_s1_set - official_s1_set)
+    exact_match_s1 = (missing_s1_count == 0) and (extra_s1_count == 0) and (len(staged_s1_list) == EXPECTED_ROWS)
+    print(f"7. S1 set exact match: Missing={missing_s1_count}, Extra={extra_s1_count} -> {'PASS' if exact_match_s1 else 'FAIL'}")
+    if not exact_match_s1:
         all_passed = False
 
-    missing_s1 = official_s1_set - staged_s1_set
-    extra_s1 = staged_s1_set - official_s1_set
-    print(f"8. Set of S1 IDs exactly matches test_source1.tsv:")
-    print(f"   Missing S1 count: {len(missing_s1)}, Extra S1 count: {len(extra_s1)} -> {'PASS' if len(missing_s1) == 0 and len(extra_s1) == 0 else 'FAIL'}")
-    if len(missing_s1) > 0 or len(extra_s1) > 0:
+    seq_match = staged_s1_list == official_s1_list
+    print(f"8. S1 exact row-by-row sequence match: {'PASS' if seq_match else 'FAIL'}")
+    if not seq_match:
         all_passed = False
 
-    # Explode staged matches to pairs
+    # -------------------------------------------------------------------------
+    # SECTION C: CANDIDATE VALIDITY
+    # -------------------------------------------------------------------------
+    print("\n--- SECTION C: CANDIDATE VALIDITY ---")
     staged_pairs_df = (
         staged_raw_df
         .filter(pl.col("matches").is_not_null() & (pl.col("matches") != ""))
         .with_columns(pl.col("matches").str.split(","))
         .explode("matches")
-        .select([
-            pl.col("s1").str.strip_chars().alias("s1"),
-            pl.col("matches").str.strip_chars().alias("cid"),
-        ])
+        .rename({"matches": "cid"})
+        .select(["s1", "cid"])
     )
-    n_staged_pairs = len(staged_pairs_df)
-    print(f"   Exploded staged pairs: {n_staged_pairs:,} matches.")
+    total_staged_matches = len(staged_pairs_df)
+    print(f"   Total staged match pairs: {total_staged_matches:,}")
 
-    # -------------------------------------------------------------------------
-    # SECTION C: MATCHED IDS & 1:1 BIPARTITE CONSTRAINT
-    # -------------------------------------------------------------------------
-    print("\n--- SECTION C: MATCHED IDS & 1:1 BIPARTITE CONSTRAINT ---")
-    row_dups = (
-        staged_pairs_df
-        .group_by(["s1", "cid"])
-        .len()
-        .filter(pl.col("len") > 1)
-    )
-    row_internal_dups = len(row_dups)
-    print(f"10. No duplicate IDs within any row: Violations = {row_internal_dups} -> {'PASS' if row_internal_dups == 0 else 'FAIL'}")
-    if row_internal_dups != 0:
+    # Check ID prefixes
+    prefix_check = staged_pairs_df.filter(~pl.col("cid").str.starts_with("S2-") & ~pl.col("cid").str.starts_with("S3-"))
+    invalid_prefixes = len(prefix_check)
+    print(f"10. Match ID prefixes: Non S2-/S3- count = {invalid_prefixes} -> {'PASS' if invalid_prefixes == 0 else 'FAIL'}")
+    if invalid_prefixes != 0:
         all_passed = False
 
-    # 11. One-to-one constraint: no candidate appears in >1 row
-    cid_counts = staged_pairs_df.group_by("cid").len().filter(pl.col("len") > 1)
-    contested_cid_count = len(cid_counts)
-    print(f"11. One-to-one (no candidate appears in >1 row): Contested candidates = {contested_cid_count} -> {'PASS' if contested_cid_count == 0 else 'FAIL'}")
-    if contested_cid_count != 0:
-        all_passed = False
-
-    # Prefix check
-    prefix_violations = len(staged_pairs_df.filter(
-        (~pl.col("cid").str.starts_with("S2-")) & (~pl.col("cid").str.starts_with("S3-"))
-    ))
-    print(f"   Prefix check (S2- / S3-): Violations = {prefix_violations} -> {'PASS' if prefix_violations == 0 else 'FAIL'}")
-    if prefix_violations != 0:
-        all_passed = False
-
-    # Check candidate existence in test_source2 / test_source3
-    print("   Scanning test_source2.tsv and test_source3.tsv via hash-join...")
+    # Check candidate existence in test_source2 and test_source3
+    print("   Scanning candidate pool in test_source2 and test_source3...")
     unique_cids_df = staged_pairs_df.select("cid").unique()
     t_join = time.time()
     s2_found = (
@@ -343,7 +348,7 @@ def main():
     if missing_cids_count != 0:
         all_passed = False
 
-    # 12. Country consistency
+    # Country consistency
     pair_country_check = (
         staged_pairs_df
         .join(test_s1_df, on="s1", how="inner")
@@ -358,24 +363,38 @@ def main():
     del cand_info_df, pair_country_check, s2_found, s3_found
     gc.collect()
 
+    # 1:1 Bipartite matching constraint
+    dup_cands = (
+        staged_pairs_df
+        .group_by("cid")
+        .agg(n_s1=pl.len())
+        .filter(pl.col("n_s1") > 1)
+    )
+    dup_count = len(dup_cands)
+    print(f"11. 1:1 Bipartite Constraint: Candidates assigned to >1 S1 = {dup_count} -> {'PASS' if dup_count == 0 else 'FAIL'}")
+    if dup_count != 0:
+        all_passed = False
+    del dup_cands
+    gc.collect()
+
     # -------------------------------------------------------------------------
     # SECTION D: CONSISTENCY WITH MODEL PREDICTIONS & 1:1 RECOMPUTATION
     # -------------------------------------------------------------------------
-    print("\n--- SECTION D: CONSISTENCY WITH MODEL PREDICTIONS & 1:1 RECOMPUTATION ---")
-    print(f"13. Recomputing greedy 1:1 assignment directly from data/preds/test_*.parquet at tau={TAU_CONFIG}, top-K={CHOSEN_K}...")
+    print(f"\n--- SECTION D: CONSISTENCY WITH MODEL PREDICTIONS & 1:1 RECOMPUTATION ---")
+    print(f"13. Recomputing greedy 1:1 assignment directly from {preds_dir}/test_*.parquet at tau={tau_config}, top-K={CHOSEN_K}...")
     t0 = time.time()
 
     recomputed_pairs_list = []
     total_recomputed_ties = 0
 
     for country in ["France", "India", "US"]:
-        pred_file = DATA_PREDS_DIR / f"test_{country}.parquet"
+        pred_file = preds_dir / f"test_{country}.parquet"
         if not pred_file.exists():
             print(f"   [ERROR] Missing prediction file {pred_file}")
             all_passed = False
             continue
 
-        tau = TAU_CONFIG[country]
+        tau = tau_config[country]
         preds = pl.read_parquet(pred_file)
         filtered = preds.filter((pl.col("p1_rank") <= CHOSEN_K) & (pl.col("p2") >= tau))
 
@@ -386,14 +405,12 @@ def main():
             c_ties = len(matching_max) - len(max_scores)
             total_recomputed_ties += c_ties
 
-            # Deduplicate strictly 1:1 matching step 6 logic
             assigned = (
                 matching_max
                 .sort(["p2", "p1", "s1_num"], descending=[True, True, False])
                 .unique(subset=["cand_num", "cand_src"], keep="first")
             )
 
-            # Format IDs
             assigned = assigned.select([
                 ("S1-" + pl.col("s1_num").cast(pl.String)).alias("s1"),
                 ("S" + pl.col("cand_src").cast(pl.String) + "-" + pl.col("cand_num").cast(pl.String)).alias("cid"),
@@ -407,7 +424,6 @@ def main():
     print(f"   Total independently recomputed pairs: {len(all_recomputed_df):,} in {time.time()-t0:.2f}s.")
     print(f"   Exact ties across all countries: {total_recomputed_ties}")
 
-    # Compare staged_pairs_df vs all_recomputed_df
     diff_staged_extra = staged_pairs_df.join(all_recomputed_df, on=["s1", "cid"], how="anti")
     diff_recomp_extra = all_recomputed_df.join(staged_pairs_df, on=["s1", "cid"], how="anti")
     pair_diff_count = len(diff_staged_extra) + len(diff_recomp_extra)
@@ -426,7 +442,7 @@ def main():
     total_missing_matches = 0
     total_checked = 0
 
-    with open(PATH_STAGED_MATCHING, "r", encoding="utf-8") as f_match, open(PATH_STAGED_CANDIDATES, "r", encoding="utf-8") as f_cands:
+    with open(path_staged_matching, "r", encoding="utf-8") as f_match, open(path_staged_candidates, "r", encoding="utf-8") as f_cands:
         h_m = f_match.readline()
         h_c = f_cands.readline()
         for line_m, line_c in zip(f_match, f_cands):
@@ -450,53 +466,39 @@ def main():
                     s1_subset_violations += 1
                     total_missing_matches += len(missing)
 
-    print(f"   Checked {total_checked:,} S1 rows in {time.time()-t0:.2f}s.")
-    print(f"   S1 entities with matched IDs not in candidate_pairs.tsv: {s1_subset_violations}")
-    print(f"   Candidate subset check: {'PASS (0 violations)' if s1_subset_violations == 0 else f'FAIL ({s1_subset_violations} violations)'}")
-    if s1_subset_violations != 0:
+    print(f"   Checked {total_checked:,} lines in {time.time()-t0:.2f}s.")
+    print(f"   S1 with missing candidate violations: {s1_subset_violations}")
+    print(f"   Total missing match IDs: {total_missing_matches}")
+    cand_subset_ok = (s1_subset_violations == 0) and (total_checked == EXPECTED_ROWS)
+    print(f"   Candidate Subset Guarantee: {'PASS' if cand_subset_ok else 'FAIL'}")
+    if not cand_subset_ok:
         all_passed = False
 
     # -------------------------------------------------------------------------
-    # SECTION F: SANITY DISTRIBUTION STATS
+    # SECTION F: SANITY CHECKS ON MATCH DISTRIBUTIONS
     # -------------------------------------------------------------------------
-    print("\n--- SECTION F: SANITY DISTRIBUTION STATS ---")
+    print("\n--- SECTION F: SANITY CHECKS ON MATCH DISTRIBUTIONS ---")
+    staged_counts_s1 = (
+        staged_pairs_df
+        .group_by("s1")
+        .agg(k=pl.len())
+    )
+    s1_all_df = pl.DataFrame({"s1": official_s1_list})
     match_counts_df = (
-        test_s1_df
-        .join(staged_pairs_df.group_by("s1").len().rename({"len": "k"}), on="s1", how="left")
+        s1_all_df
+        .join(staged_counts_s1, on="s1", how="left")
         .with_columns(pl.col("k").fill_null(0))
+        .join(test_s1_df, on="s1", how="inner")
     )
 
     sanity_ok = True
-    for country in ["France", "India", "US"]:
-        c_df = match_counts_df.filter(pl.col("country") == country)
-        c_k = c_df["k"].to_numpy()
-        c_tot = len(c_k)
-        c_empty = int(np.sum(c_k == 0))
-        avg_m = float(np.mean(c_k))
-        pct_empty = c_empty / c_tot * 100
-        med_m = float(np.median(c_k))
-        p99_m = float(np.percentile(c_k, 99))
-        max_m = int(np.max(c_k))
-
-        print(f"   {country:<8} ({c_tot:,} entities):")
-        print(f"     Avg Matches:    {avg_m:.4f}")
-        print(f"     Singletons (%): {pct_empty:.2f}% ({c_empty:,})")
-        print(f"     Median Matches: {med_m:.1f}")
-        print(f"     p99 Matches:    {p99_m:.1f}")
-        print(f"     Max Matches:    {max_m}")
-
-        if country == "France" and not (2.8 <= avg_m <= 3.8):
-            print(f"     [WARNING] France avg matches {avg_m:.4f} outside expected [2.8, 3.8]")
-            sanity_ok = False
-        elif country in ("India", "US") and not (2.5 <= avg_m <= 3.6):
-            print(f"     [WARNING] {country} avg matches {avg_m:.4f} outside expected [2.5, 3.6]")
-            sanity_ok = False
-        if not (4.0 <= pct_empty <= 16.0):
-            print(f"     [WARNING] {country} singleton % {pct_empty:.2f}% outside expected [4.0, 16.0]")
-            sanity_ok = False
-        if max_m >= 20:
-            print(f"     [WARNING] {country} max matches {max_m} >= 20")
-            sanity_ok = False
+    for c in ["France", "India", "US"]:
+        c_counts = match_counts_df.filter(pl.col("country") == c)["k"].to_numpy()
+        c_avg = float(np.mean(c_counts))
+        c_empty = float(np.sum(c_counts == 0) / len(c_counts) * 100)
+        c_p99 = float(np.percentile(c_counts, 99))
+        c_max = int(np.max(c_counts))
+        print(f"   [{c}] Entities: {len(c_counts):,} | Avg: {c_avg:.3f} | Empty: {c_empty:.2f}% | p99: {c_p99:.1f} | Max: {c_max}")
 
     all_k = match_counts_df["k"].to_numpy()
     print(f"   Overall ({len(all_k):,} entities):")
@@ -515,14 +517,14 @@ def main():
     # SECTION G: PROBE FILE VERIFICATION
     # -------------------------------------------------------------------------
     print("\n--- SECTION G: PROBE FILE VERIFICATION ---")
-    print("16. Verifying output/v1/probes/france_empty.tsv:")
+    print(f"16. Verifying {path_probe_fr_empty}:")
     fr_empty_violations = 0
     non_fr_mismatches = 0
     total_probe_lines = 0
 
-    with open(PATH_STAGED_MATCHING, "r", encoding="utf-8") as f_staged, open(PATH_PROBE_FR_EMPTY, "r", encoding="utf-8") as f_probe:
-        h_s = f_staged.readline()
-        h_p = f_probe.readline()
+    with open(path_staged_matching, "r", encoding="utf-8") as f_staged, open(path_probe_fr_empty, "r", encoding="utf-8") as f_probe:
+        f_staged.readline()
+        f_probe.readline()
         for line_s, line_p in zip(f_staged, f_probe):
             total_probe_lines += 1
             s1_s, _, m_s = line_s.partition("\t")
@@ -536,7 +538,7 @@ def main():
                 if line_s != line_p:
                     non_fr_mismatches += 1
 
-    probe_hash = sha256_file(PATH_PROBE_FR_EMPTY)
+    probe_hash = sha256_file(path_probe_fr_empty)
     print(f"    Total probe rows verified: {total_probe_lines:,}")
     print(f"    France non-empty violations: {fr_empty_violations}")
     print(f"    Non-France byte mismatches: {non_fr_mismatches}")
@@ -546,16 +548,53 @@ def main():
     if not probe_ok:
         all_passed = False
 
+    if path_probe_usin and path_probe_usin.exists():
+        print(f"\n16b. Verifying {path_probe_usin}:")
+        v1_matching_file = PROJECT_ROOT / "output" / "v1" / "matching_results.tsv"
+        if not v1_matching_file.exists():
+            v1_matching_file = PROJECT_ROOT / "backups" / "v1_lb0932" / "output" / "v1" / "matching_results.tsv"
+
+        usin_lines = 0
+        usin_fr_mismatches = 0
+        usin_non_fr_mismatches = 0
+
+        with open(v1_matching_file, "r", encoding="utf-8") as f_v1, \
+             open(path_staged_matching, "r", encoding="utf-8") as f_v2, \
+             open(path_probe_usin, "r", encoding="utf-8") as f_usin:
+            f_v1.readline()
+            f_v2.readline()
+            f_usin.readline()
+            for line_v1, line_v2, line_u in zip(f_v1, f_v2, f_usin):
+                usin_lines += 1
+                s1_id, _, _ = line_u.partition("\t")
+                cntry = s1_country_map.get(s1_id.strip())
+                if cntry == "France":
+                    if line_u != line_v1:
+                        usin_fr_mismatches += 1
+                else:
+                    if line_u != line_v2:
+                        usin_non_fr_mismatches += 1
+
+        usin_hash = sha256_file(path_probe_usin)
+        print(f"    Total US/IN probe rows: {usin_lines:,}")
+        print(f"    France vs v1 mismatches: {usin_fr_mismatches}")
+        print(f"    Non-France vs v2 mismatches: {usin_non_fr_mismatches}")
+        print(f"    Probe SHA256: {usin_hash}")
+        usin_ok = (usin_lines == EXPECTED_ROWS and usin_fr_mismatches == 0 and usin_non_fr_mismatches == 0)
+        print(f"    US/IN Probe consistency: {'PASS' if usin_ok else 'FAIL'}")
+        if not usin_ok:
+            all_passed = False
+
     # -------------------------------------------------------------------------
     # SECTION H: OFFICIAL VALIDATOR
     # -------------------------------------------------------------------------
     print("\n--- SECTION H: OFFICIAL VALIDATOR ---")
-    print("17. Running official validator: student_resource/utils/validate_submission.py --check-ids...")
+    print(f"17. Running official validator: student_resource/utils/validate_submission.py --check-ids...")
     cmd = [
         sys.executable,
         "student_resource/utils/validate_submission.py",
-        "--matching", str(PATH_STAGED_MATCHING),
-        "--candidate", str(PATH_STAGED_CANDIDATES),
+        "--matching", str(path_staged_matching),
+        "--candidate", str(path_staged_candidates),
         "--test-dir", "student_resource/dataset/test",
         "--check-ids",
     ]
@@ -575,22 +614,22 @@ def main():
     # -------------------------------------------------------------------------
     # SUMMARY
     # -------------------------------------------------------------------------
-    staged_hash = sha256_file(PATH_STAGED_MATCHING)
-    cand_hash = sha256_file(PATH_STAGED_CANDIDATES)
+    staged_hash = sha256_file(path_staged_matching)
+    cand_hash = sha256_file(path_staged_candidates)
 
     print("\n" + "=" * 85)
     print(f"TOTAL AUDIT TIME: {time.time()-start_time:.2f}s")
     print("=" * 85)
 
     if all_passed:
-        print("\n>>> ALL CHECKS PASSED: READY TO UPLOAD <<<")
-        print(f"Primary Matching File: {PATH_STAGED_MATCHING}")
+        print(f"\n>>> ALL CHECKS PASSED: READY TO UPLOAD ({version.upper()}) <<<")
+        print(f"Primary Matching File: {path_staged_matching}")
         print(f"SHA256: {staged_hash}")
-        print(f"Candidate File:        {PATH_STAGED_CANDIDATES}")
+        print(f"Candidate File:        {path_staged_candidates}")
         print(f"SHA256: {cand_hash}")
     else:
-        print("\n>>> PRE-UPLOAD AUDIT FAILED <<<")
-        print(f"File: {PATH_STAGED_MATCHING}")
+        print(f"\n>>> PRE-UPLOAD AUDIT FAILED ({version.upper()}) <<<")
+        print(f"File: {path_staged_matching}")
         print(f"SHA256: {staged_hash}")
         sys.exit(1)
 

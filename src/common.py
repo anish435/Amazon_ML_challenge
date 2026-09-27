@@ -22,7 +22,13 @@ DATA_BLOCKS_DIR = PROJECT_ROOT / "data" / "blocks"
 DATA_FEATURES_DIR = PROJECT_ROOT / "data" / "features"
 DATA_MODELS_DIR = PROJECT_ROOT / "data" / "models"
 DATA_PREDS_DIR = PROJECT_ROOT / "data" / "preds"
+
+# Improvement Round v2 directories
+DATA_FEATURES_V2_DIR = PROJECT_ROOT / "data" / "features_v2"
+DATA_MODELS_V2_DIR = PROJECT_ROOT / "data" / "models_v2"
+DATA_PREDS_V2_DIR = PROJECT_ROOT / "data" / "preds_v2"
 OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_V2_DIR = OUTPUT_DIR / "v2"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 FALLBACK_DIR = PROJECT_ROOT / "fallback"
 TOOLS_DIR = PROJECT_ROOT / "tools"
