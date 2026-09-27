@@ -609,3 +609,10 @@ Exact ground-truth match recall on blocked candidates across validation and hold
 - **Upper Bound (France $\approx$ 0.940)**: **0.9547**
 - **Primary Upload File**: `output\v2/matching_results.tsv` (alongside `output\v2/candidate_pairs.tsv`)
 
+### 6. Official Leaderboard Result (v2 Live Submission)
+- **Submission Time**: 27 Sep 2026, 11:31 AM IST
+- **Primary Submission File**: `output/v2/matching_results.tsv` (SHA256: `cbda2d6f89aade847a35fd93c1e55a1f1e20ffbbedbfa5a5216db57aa43bd7da`)
+- **Official Public Leaderboard Score**: **0.946**
+- **Improvement over v1**: **+0.014** (from 0.932 to 0.946)
+- **Validation**: Accurately hits our honest predicted range [0.938 – 0.950] (expected ~0.944).
+
